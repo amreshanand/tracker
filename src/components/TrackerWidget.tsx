@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { getPlatformLabel, detectPlatform } from "@/lib/platform";
 
 interface AvailabilityResult {
@@ -62,6 +62,16 @@ export function TrackerWidget() {
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState<CheckResult | null>(null);
   const [error, setError] = useState("");
+  const [lastFetchedUrl, setLastFetchedUrl] = useState("");
+  const [metadataLoading, setMetadataLoading] = useState(false);
+  const [scrapedMetadata, setScrapedMetadata] = useState<{
+    name: string;
+    description: string;
+    imageUrl: string;
+    price: string;
+    platform: string;
+  } | null>(null);
+  const [showFullDesc, setShowFullDesc] = useState(false);
 
   // Notify form
   const [notifyName, setNotifyName] = useState("");
@@ -76,12 +86,68 @@ export function TrackerWidget() {
 
   const detectedPlatform = productUrl ? detectPlatform(productUrl) : "";
 
+  const isValidUrl = (url: string) => {
+    try {
+      new URL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // Auto-scrape metadata when a valid URL is entered/pasted
+  useEffect(() => {
+    if (!productUrl || !isValidUrl(productUrl)) {
+      const timer = setTimeout(() => {
+        setScrapedMetadata(null);
+        setLastFetchedUrl("");
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+
+    if (productUrl === lastFetchedUrl) {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setMetadataLoading(true);
+      setScrapedMetadata(null);
+      setError(prev => prev !== "" ? "" : prev);
+      try {
+        const res = await fetch("/api/products/scrape", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: productUrl }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success) {
+            setScrapedMetadata(data);
+            // Auto-fill product name if empty or default
+            if (!productName || productName === "Unknown Product" || productName === "") {
+              setProductName(data.name);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to scrape metadata:", err);
+      } finally {
+        setMetadataLoading(false);
+        setLastFetchedUrl(productUrl);
+      }
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [productUrl, lastFetchedUrl, productName]);
+
   const selectSample = useCallback((sample: typeof SAMPLE_PRODUCTS[number]) => {
     setProductName(sample.name);
     setProductUrl(sample.url);
+    setScrapedMetadata(null);
+    setLastFetchedUrl("");
     setResults(null);
     setError("");
-  }, []);
+  }, [setProductName, setProductUrl, setScrapedMetadata, setLastFetchedUrl, setResults, setError]);
 
   const handleCheck = async () => {
     if (!productUrl) {
@@ -97,6 +163,9 @@ export function TrackerWidget() {
       const body: Record<string, unknown> = {
         productUrl,
         productName: productName || "Unknown Product",
+        imageUrl: scrapedMetadata?.imageUrl || null,
+        price: scrapedMetadata?.price || null,
+        description: scrapedMetadata?.description || null,
       };
 
       if (checkMode === "pincode" && checkPincode) {
@@ -275,6 +344,87 @@ export function TrackerWidget() {
                   </div>
                 </div>
               </div>
+
+              {/* Product Preview Loading Skeleton */}
+              {metadataLoading && (
+                <div className="mb-6 p-5 border border-slate-200 rounded-2xl bg-slate-50/50 flex gap-4 animate-pulse">
+                  <div className="w-24 h-24 rounded-xl skeleton flex-shrink-0" />
+                  <div className="flex-1 space-y-3 py-1">
+                    <div className="h-4 skeleton rounded w-1/4" />
+                    <div className="h-6 skeleton rounded w-3/4" />
+                    <div className="h-4 skeleton rounded w-1/2" />
+                    <div className="space-y-2">
+                      <div className="h-3 skeleton rounded" />
+                      <div className="h-3 skeleton rounded w-5/6" />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Product Preview Card */}
+              {!metadataLoading && scrapedMetadata && (
+                <div className="mb-6 p-5 border border-slate-200 rounded-2xl bg-gradient-to-br from-white to-slate-50 shadow-sm hover:shadow-md transition-all duration-300 flex flex-col sm:flex-row gap-5 relative overflow-hidden group">
+                  <div className="absolute -right-20 -bottom-20 w-48 h-48 rounded-full bg-primary-100/30 blur-3xl pointer-events-none" />
+                  
+                  {scrapedMetadata.imageUrl ? (
+                    <div className="w-24 h-24 sm:w-32 sm:h-32 rounded-xl bg-white border border-slate-100 flex items-center justify-center p-2 flex-shrink-0 shadow-sm relative overflow-hidden group-hover:scale-105 transition-transform duration-300">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img 
+                        src={scrapedMetadata.imageUrl} 
+                        alt={scrapedMetadata.name} 
+                        className="max-h-full max-w-full object-contain"
+                      />
+                    </div>
+                  ) : (
+                    <div className="w-24 h-24 sm:w-32 sm:h-32 rounded-xl bg-slate-100 border border-slate-200 flex flex-col items-center justify-center p-2 flex-shrink-0">
+                      <svg className="w-8 h-8 text-slate-400" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+                      </svg>
+                      <span className="text-[10px] text-slate-400 mt-1 font-medium">No Image</span>
+                    </div>
+                  )}
+
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-2 mb-1">
+                      <span className="px-2 py-0.5 rounded-md text-[10px] font-bold tracking-wider uppercase bg-primary-50 border border-primary-100 text-primary-600">
+                        {getPlatformLabel(scrapedMetadata.platform)}
+                      </span>
+                      {scrapedMetadata.price && (
+                        <span className="px-2.5 py-0.5 rounded-md text-xs font-extrabold bg-success-50 border border-success-100 text-success-700">
+                          {scrapedMetadata.price}
+                        </span>
+                      )}
+                    </div>
+
+                    <h4 className="text-base sm:text-lg font-bold text-slate-900 leading-snug mb-1.5">
+                      {scrapedMetadata.name}
+                    </h4>
+
+                    {scrapedMetadata.description && (
+                      <div className="text-xs sm:text-sm text-slate-600 font-medium leading-relaxed">
+                        <p>
+                          {showFullDesc 
+                            ? scrapedMetadata.description 
+                            : `${scrapedMetadata.description.slice(0, 160)}${scrapedMetadata.description.length > 160 ? '...' : ''}`
+                          }
+                          {scrapedMetadata.description.length > 160 && (
+                            <button
+                              onClick={() => setShowFullDesc(!showFullDesc)}
+                              className="text-primary-600 hover:text-primary-700 font-bold ml-1.5 focus:outline-none inline-flex items-center gap-0.5"
+                            >
+                              {showFullDesc ? 'Show Less' : 'Read More'}
+                              <svg className={`w-3 h-3 transition-transform ${showFullDesc ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+                              </svg>
+                            </button>
+                          )}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
 
               {/* Quick select */}
               <div className="mb-6">

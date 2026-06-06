@@ -25,7 +25,8 @@ export interface FlipkartCheckResult {
 /**
  * Get or create browser instance
  */
-async function getBrowser(): Promise<Browser | null> {
+export async function getBrowser(): Promise<Browser | null> {
+
   if (browserInstance) {
     try {
       // Check if browser is still connected
@@ -47,6 +48,9 @@ async function getBrowser(): Promise<Browser | null> {
     
     // Try common paths
     const paths = [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
       "/usr/bin/chromium",
       "/usr/bin/chromium-browser",
       "/usr/bin/google-chrome",

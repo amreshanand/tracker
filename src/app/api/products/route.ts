@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { name, url, price, imageUrl } = body;
+    const { name, url, price, imageUrl, description } = body;
 
     if (!name || !url) {
       return Response.json(
@@ -35,6 +35,7 @@ export async function POST(request: Request) {
           platform,
           price: price || existing[0].price,
           imageUrl: imageUrl || existing[0].imageUrl,
+          description: description || existing[0].description,
           updatedAt: new Date(),
         })
         .where(eq(products.id, existing[0].id))
@@ -51,6 +52,7 @@ export async function POST(request: Request) {
         platform,
         price: price || null,
         imageUrl: imageUrl || null,
+        description: description || null,
       })
       .returning();
 

@@ -14,7 +14,7 @@ export const dynamic = "force-dynamic";
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { productUrl, productName, pincode, checkAll } = body;
+    const { productUrl, productName, pincode, checkAll, imageUrl, price, description } = body;
 
     if (!productUrl) {
       return Response.json(
@@ -38,8 +38,26 @@ export async function POST(request: Request) {
           name: productName || "Unknown Product",
           url: productUrl,
           platform,
+          imageUrl: imageUrl || null,
+          price: price || null,
+          description: description || null,
         })
         .returning();
+    } else {
+      const prod = productRecord[0];
+      if ((imageUrl && !prod.imageUrl) || (price && !prod.price) || (description && !prod.description) || (productName && productName !== "Unknown Product" && productName !== prod.name)) {
+        productRecord = await db
+          .update(products)
+          .set({
+            name: productName && productName !== "Unknown Product" ? productName : prod.name,
+            imageUrl: imageUrl || prod.imageUrl,
+            price: price || prod.price,
+            description: description || prod.description,
+            updatedAt: new Date(),
+          })
+          .where(eq(products.id, prod.id))
+          .returning();
+      }
     }
 
     const product = productRecord[0];
@@ -138,7 +156,8 @@ export async function POST(request: Request) {
         });
       }
 
-      const result = await checkSinglePincodeAvailability(productUrl, pincode);
+      const result = await checkSinglePincodeAvailability(productUrl, pincode, true);
+
 
       // Store in DB
       await db

@@ -75,7 +75,10 @@ export function DashboardContent() {
   }, [emailFilter]);
 
   useEffect(() => {
-    fetchData();
+    const timer = setTimeout(() => {
+      fetchData();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [fetchData]);
 
   const handleProcessNotifications = async () => {

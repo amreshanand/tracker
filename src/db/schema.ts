@@ -16,6 +16,7 @@ export const products = pgTable("products", {
   platform: varchar("platform", { length: 100 }).notNull().default("unknown"),
   imageUrl: text("image_url"),
   price: varchar("price", { length: 100 }),
+  description: text("description"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

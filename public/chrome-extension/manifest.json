@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Product Availability Tracker",
+  "version": "1.0.0",
+  "description": "Check product delivery availability across India. Get notified when products become available at your pincode.",
+  "permissions": ["activeTab", "storage", "notifications"],
+  "host_permissions": ["https://www.flipkart.com/*", "https://www.amazon.in/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.flipkart.com/*"],
+      "js": ["content-flipkart.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.amazon.in/*"],
+      "js": ["content-amazon.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

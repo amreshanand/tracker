@@ -1,13 +1,14 @@
 /**
- * Flipkart Real Availability Checker via API
+ * Flipkart Real Availability Checker
  *
- * Strategy:
- * 1. Fetch product page to determine global stock status & product details
- * 2. For pincode-specific delivery checks, use Flipkart's internal
- *    serviceability widget API (real, not simulated)
+ * Uses Flipkart's actual BFF (Backend-for-Frontend) Rome API to check
+ * pincode-level serviceability. This is the same API that Flipkart's
+ * own website calls when you enter a pincode in the delivery check widget.
  *
- * Note: Flipkart blocks Puppeteer/headless browsers. We use targeted HTTP
- * requests with appropriate headers to their API endpoints instead.
+ * Strategy waterfall (each tried in order, stops at first definitive answer):
+ *  A. Rome API  — POST 1.rome.api.flipkart.com/api/4/page/fetch
+ *  B. Product page fetch with X-Pincode header (mobile BFF)
+ *  C. Puppeteer browser automation (most reliable, used as last resort)
  */
 
 export interface FlipkartApiResult {
@@ -19,14 +20,22 @@ export interface FlipkartApiResult {
   pincode: string;
   available: boolean;
   deliveryInfo: string | null;
+  deliveryDate: string | null;
   error: string | null;
-  source: "api" | "fallback" | "simulated";
+  /** Which strategy produced this result */
+  source: "rome_api" | "page_fetch" | "puppeteer" | "fallback";
   isGloballyOutOfStock?: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /**
- * Extract Flipkart product ID from URL
- * Flipkart URLs: /product-name/p/ITMABC123 or ?pid=ITMABC123
+ * Extract Flipkart product ID (pid) from URL.
+ * Handles formats:
+ *   /product-name/p/ITMABC123
+ *   ?pid=ITMABC123
  */
 export function extractFlipkartProductId(url: string): string | null {
   try {
@@ -41,9 +50,29 @@ export function extractFlipkartProductId(url: string): string | null {
   }
 }
 
+/** Build browser-like request headers for Flipkart */
+function flipkartHeaders(referer: string, extra?: Record<string, string>) {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    Accept: "application/json, text/html, */*",
+    "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    Referer: referer,
+    Origin: "https://www.flipkart.com",
+    "x-user-agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
+    ...extra,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Product page fetcher (global stock status)
+// ---------------------------------------------------------------------------
+
 /**
- * Fetch Flipkart product details + global availability from product page
- * Returns whether the product is in stock at all (before pincode check)
+ * Fetch Flipkart product page and extract global availability + metadata.
+ * Does NOT do any pincode-specific check.
  */
 export async function fetchFlipkartProductDetails(productUrl: string): Promise<{
   name: string | null;
@@ -54,19 +83,22 @@ export async function fetchFlipkartProductDetails(productUrl: string): Promise<{
   isGloballyOutOfStock: boolean;
   html: string;
 }> {
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
-    "Cache-Control": "no-cache",
-    Pragma: "no-cache",
-    Referer: "https://www.flipkart.com/",
-    Connection: "keep-alive",
-  };
-
   try {
-    const response = await fetch(productUrl, { headers });
+    const response = await fetch(productUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+        Referer: "https://www.flipkart.com/",
+        Connection: "keep-alive",
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(15_000),
+    });
+
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
 
@@ -77,66 +109,88 @@ export async function fetchFlipkartProductDetails(productUrl: string): Promise<{
     let available = false;
 
     // 1. JSON-LD structured data (most reliable)
-    const jsonLdRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+    const jsonLdRegex =
+      /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
     let m;
     while ((m = jsonLdRegex.exec(html)) !== null) {
       try {
         const json = JSON.parse(m[1]);
-        const candidates = [];
+        const candidates: Record<string, unknown>[] = [];
         if (json["@type"] === "Product") candidates.push(json);
         if (Array.isArray(json["@graph"])) {
-          candidates.push(...json["@graph"].filter((x: { "@type": string }) => x["@type"] === "Product"));
+          candidates.push(
+            ...(json["@graph"] as Record<string, unknown>[]).filter(
+              (x) => x["@type"] === "Product"
+            )
+          );
         }
         for (const product of candidates) {
-          if (!name && product.name) name = product.name;
-          if (!description && product.description) description = product.description;
+          if (!name && product.name) name = product.name as string;
+          if (!description && product.description)
+            description = product.description as string;
           if (!imageUrl && product.image) {
-            imageUrl = Array.isArray(product.image) ? product.image[0] : product.image;
+            imageUrl = Array.isArray(product.image)
+              ? (product.image[0] as string)
+              : (product.image as string);
           }
           if (product.offers) {
-            const offer = Array.isArray(product.offers) ? product.offers[0] : product.offers;
+            const offer = Array.isArray(product.offers)
+              ? (product.offers as Record<string, unknown>[])[0]
+              : (product.offers as Record<string, unknown>);
             if (offer?.price) {
-              const priceNum = parseFloat(String(offer.price).replace(/,/g, ""));
-              if (!isNaN(priceNum)) price = `₹${priceNum.toLocaleString("en-IN")}`;
+              const priceNum = parseFloat(
+                String(offer.price).replace(/,/g, "")
+              );
+              if (!isNaN(priceNum))
+                price = `₹${priceNum.toLocaleString("en-IN")}`;
             }
-            available = offer?.availability?.includes("InStock") ?? false;
+            available =
+              (offer?.availability as string)?.includes("InStock") ?? false;
           }
           if (name) break;
         }
-      } catch { /* continue */ }
+      } catch {
+        /* continue */
+      }
     }
 
-    // 2. OG meta tags fallback
-    const getMetaContent = (attr: string, val: string): string => {
-      const patterns = [
+    // 2. OG meta tag fallbacks
+    const metaContent = (attr: string, val: string): string => {
+      for (const pat of [
         new RegExp(`${attr}="${val}"\\s+content="([^"]+)"`, "i"),
         new RegExp(`content="([^"]+)"\\s+${attr}="${val}"`, "i"),
-      ];
-      for (const p of patterns) {
-        const match = html.match(p);
+      ]) {
+        const match = html.match(pat);
         if (match?.[1]) return match[1].trim();
       }
       return "";
     };
+    if (!name)
+      name =
+        metaContent("property", "og:title") ||
+        metaContent("name", "twitter:title");
+    if (!description)
+      description =
+        metaContent("property", "og:description") ||
+        metaContent("name", "description");
+    if (!imageUrl) imageUrl = metaContent("property", "og:image");
 
-    if (!name) name = getMetaContent("property", "og:title") || getMetaContent("name", "twitter:title");
-    if (!description) description = getMetaContent("property", "og:description") || getMetaContent("name", "description");
-    if (!imageUrl) imageUrl = getMetaContent("property", "og:image");
-
-    // 3. Price patterns in HTML
+    // 3. Price from HTML patterns
     if (!price) {
-      const pricePat = [
+      for (const pat of [
         /class="[^"]*Nx9bqj[^"]*"[^>]*>₹?\s*([\d,]+)/,
         /class="[^"]*_30jeq3[^"]*"[^>]*>₹?\s*([\d,]+)/,
         /"finalPrice"\s*:\s*\{\s*"value"\s*:\s*([\d.]+)/,
         /"decimalValue"\s*:\s*([\d.]+)/,
         /data-price="([\d.]+)"/,
-      ];
-      for (const pat of pricePat) {
+      ]) {
         const pm = html.match(pat);
         if (pm) {
           const num = parseFloat(pm[1].replace(/,/g, ""));
-          if (!isNaN(num)) { price = `₹${num.toLocaleString("en-IN")}`; break; }
+          if (!isNaN(num)) {
+            price = `₹${num.toLocaleString("en-IN")}`;
+            break;
+          }
         }
       }
     }
@@ -150,7 +204,7 @@ export async function fetchFlipkartProductDetails(productUrl: string): Promise<{
         .trim();
     }
 
-    // 5. Detect global out-of-stock (before any pincode check)
+    // 5. Global out-of-stock detection
     const lowerHtml = html.toLowerCase();
     const globalOOS =
       lowerHtml.includes("currently out of stock") ||
@@ -158,14 +212,11 @@ export async function fetchFlipkartProductDetails(productUrl: string): Promise<{
       lowerHtml.includes("currently unavailable") ||
       lowerHtml.includes("not available right now");
 
-    // If JSON-LD didn't set available, check for cart/buy signals
     if (!available && !globalOOS) {
       available =
-        lowerHtml.includes("add to cart") ||
-        lowerHtml.includes("buy now");
+        lowerHtml.includes("add to cart") || lowerHtml.includes("buy now");
     }
 
-    // 6. Check if we even got the product page (not Flipkart homepage redirect)
     const isProductPage =
       (name && !name.includes("Buy Products Online")) ||
       lowerHtml.includes('"@type":"product"') ||
@@ -173,171 +224,237 @@ export async function fetchFlipkartProductDetails(productUrl: string): Promise<{
       lowerHtml.includes("buy now");
 
     if (!isProductPage) {
-      return { name: null, description: null, imageUrl: null, price: null, available: false, isGloballyOutOfStock: false, html };
+      return {
+        name: null,
+        description: null,
+        imageUrl: null,
+        price: null,
+        available: false,
+        isGloballyOutOfStock: false,
+        html,
+      };
     }
 
-    return { name, description, imageUrl, price, available: available && !globalOOS, isGloballyOutOfStock: globalOOS, html };
+    return {
+      name,
+      description,
+      imageUrl,
+      price,
+      available: available && !globalOOS,
+      isGloballyOutOfStock: globalOOS,
+      html,
+    };
   } catch (error) {
     console.error("Flipkart product fetch error:", error);
-    return { name: null, description: null, imageUrl: null, price: null, available: false, isGloballyOutOfStock: false, html: "" };
+    return {
+      name: null,
+      description: null,
+      imageUrl: null,
+      price: null,
+      available: false,
+      isGloballyOutOfStock: false,
+      html: "",
+    };
   }
 }
 
+// ---------------------------------------------------------------------------
+// Strategy A: Flipkart Rome API
+// ---------------------------------------------------------------------------
+
 /**
- * Check Flipkart pincode serviceability using their internal widget API.
- *
- * Flipkart's serviceability widget endpoint:
- *   POST https://www.flipkart.com/api/4/page/fetch
- *   with pageUri (product page slug) and pincode cookie
- *
- * Also tries their delivery pincode check widget directly.
+ * Parse delivery info from Flipkart's Rome API JSON response.
+ * The Rome API wraps page widgets as JSON — we look for the DELIVERY slot.
  */
-export async function checkFlipkartPincodeServiceability(
-  productUrl: string,
-  pincode: string,
-  productHtml?: string  // Pass pre-fetched HTML to avoid redundant requests
-): Promise<FlipkartApiResult> {
-  const productId = extractFlipkartProductId(productUrl);
-
-  const result: FlipkartApiResult = {
-    success: false,
-    productName: null,
-    description: null,
-    imageUrl: null,
-    price: null,
-    pincode,
-    available: false,
-    deliveryInfo: null,
-    error: null,
-    source: "api",
-  };
-
-  // ─── Strategy 1: Flipkart's internal serviceability check API ───────────
-  // Flipkart uses this endpoint to check if a product can be delivered to a pincode.
-  // It requires the listing ID (lid) from the URL.
-  const urlObj = new URL(productUrl);
-  const lid = urlObj.searchParams.get("lid");
-  const otracker = urlObj.searchParams.get("otracker");
-
-  // Build the serviceability check URL using Flipkart's widget API
-  // Their internal API checks serviceability for the seller/listing
-  if (productId) {
-    // Method A: Flipkart's delivery check endpoint (used by their own website)
-    const checkUrl = `https://www.flipkart.com/api/4/product/delivery?pid=${productId}&pincode=${pincode}${lid ? `&lid=${lid}` : ""}`;
-
-    try {
-      const apiResponse = await fetch(checkUrl, {
-        method: "GET",
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Accept: "application/json, text/plain, */*",
-          "Accept-Language": "en-IN,en;q=0.9",
-          Referer: productUrl,
-          "x-user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
-        },
-        signal: AbortSignal.timeout(8000),
-      });
-
-      if (apiResponse.ok) {
-        const contentType = apiResponse.headers.get("content-type") || "";
-        if (contentType.includes("application/json")) {
-          const data = await apiResponse.json();
-          // Parse various response shapes from Flipkart API
-          const deliveryData =
-            data?.data?.deliveryInfo ||
-            data?.deliveryInfo ||
-            data?.serviceabilityInfo;
-
-          if (deliveryData !== undefined) {
-            const isDeliverable =
-              deliveryData?.isDeliverable ??
-              deliveryData?.available ??
-              (data?.statusCode === 200 && !data?.errorMessage);
-
-            result.available = Boolean(isDeliverable);
-            result.deliveryInfo = deliveryData?.message ||
-              deliveryData?.deliveryMessage ||
-              (result.available ? `Deliverable to ${pincode}` : `Not serviceable to ${pincode}`);
-            result.success = true;
-            result.source = "api";
-            return result;
-          }
-        }
-      }
-    } catch (err) {
-      console.log("Flipkart API endpoint A failed:", err);
-    }
-
-    // Method B: Flipkart's page widget serviceability check
-    // This fetches the delivery widget HTML which shows real serviceability
-    try {
-      const widgetUrl = `https://www.flipkart.com/api/4/widget/page?pageUri=${encodeURIComponent(urlObj.pathname + urlObj.search)}&pincode=${pincode}&pid=${productId}`;
-
-      const widgetResponse = await fetch(widgetUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Accept: "application/json, text/html, */*",
-          "Accept-Language": "en-IN,en;q=0.9",
-          Referer: productUrl,
-        },
-        signal: AbortSignal.timeout(8000),
-      });
-
-      if (widgetResponse.ok) {
-        const text = await widgetResponse.text();
-        const lowerText = text.toLowerCase();
-
-        const notServiceable = [
-          "not serviceable", "not deliverable", "delivery not available",
-          "cannot be delivered", "pincode is not serviceable",
-          "no sellers deliver to this pincode",
-        ].some(p => lowerText.includes(p));
-
-        if (notServiceable) {
-          result.available = false;
-          result.deliveryInfo = `Not serviceable to pincode ${pincode}`;
-          result.success = true;
-          result.source = "api";
-          return result;
-        }
-
-        const isDeliverable = ["delivery by", "free delivery", "arrives by", "estimated delivery"]
-          .some(p => lowerText.includes(p));
-
-        if (isDeliverable) {
-          result.available = true;
-          result.deliveryInfo = `Delivery available to ${pincode}`;
-          result.success = true;
-          result.source = "api";
-          return result;
-        }
-      }
-    } catch (err) {
-      console.log("Flipkart widget API failed:", err);
-    }
-  }
-
-  // ─── Strategy 2: Fetch product page with pincode cookie set ─────────────
-  // Setting the pincode cookie causes Flipkart to show delivery info for that location
+function parseRomeApiResponse(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  data: any,
+  pincode: string
+): { available: boolean; deliveryInfo: string | null; deliveryDate: string | null } | null {
   try {
-    const pageResponse = await fetch(productUrl, {
+    // The response is a deeply nested widget tree. We flatten and search.
+    const json = JSON.stringify(data).toLowerCase();
+
+    // Explicit not-serviceable signals
+    const notServiceableKeywords = [
+      "not serviceable",
+      "not deliverable",
+      "cannot be delivered",
+      "no sellers deliver",
+      "pincode is not serviceable",
+      "delivery not available",
+      "doesn't deliver to",
+      "does not deliver to",
+    ];
+    if (notServiceableKeywords.some((k) => json.includes(k))) {
+      return {
+        available: false,
+        deliveryInfo: `Not serviceable to pincode ${pincode}`,
+        deliveryDate: null,
+      };
+    }
+
+    // Look for delivery date patterns in the raw JSON
+    const deliveryDateMatch = JSON.stringify(data).match(
+      /(?:delivery by|deliverydate|estimated delivery)[^"]*"([^"]*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[^"]*\d{1,2}[^"]*\d{0,4})/i
+    );
+    const deliveryDate = deliveryDateMatch ? deliveryDateMatch[1].trim() : null;
+
+    // Positive delivery signals
+    const deliverableKeywords = [
+      "delivery by",
+      "free delivery",
+      "arrives by",
+      "estimated delivery",
+      "delivery in",
+      "delivered by",
+    ];
+    if (deliverableKeywords.some((k) => json.includes(k))) {
+      return {
+        available: true,
+        deliveryInfo: deliveryDate
+          ? `Delivery by ${deliveryDate}`
+          : `Delivery available to ${pincode}`,
+        deliveryDate,
+      };
+    }
+
+    // Check for serviceability flags in structured data
+    const dataStr = JSON.stringify(data);
+    if (
+      dataStr.includes('"isServiceable":true') ||
+      dataStr.includes('"serviceable":true') ||
+      dataStr.includes('"available":true')
+    ) {
+      return {
+        available: true,
+        deliveryInfo: `Delivery available to ${pincode}`,
+        deliveryDate: null,
+      };
+    }
+    if (
+      dataStr.includes('"isServiceable":false') ||
+      dataStr.includes('"serviceable":false')
+    ) {
+      return {
+        available: false,
+        deliveryInfo: `Not serviceable to pincode ${pincode}`,
+        deliveryDate: null,
+      };
+    }
+
+    // Out of stock signals
+    if (
+      json.includes("out of stock") ||
+      json.includes("currently unavailable") ||
+      json.includes("sold out")
+    ) {
+      return {
+        available: false,
+        deliveryInfo: "Product is currently out of stock",
+        deliveryDate: null,
+      };
+    }
+
+    return null; // Ambiguous — no definitive signal found
+  } catch {
+    return null;
+  }
+}
+
+async function checkViaRomeApi(
+  productUrl: string,
+  pincode: string
+): Promise<FlipkartApiResult | null> {
+  try {
+    const urlObj = new URL(productUrl);
+    const pageUri = urlObj.pathname + urlObj.search;
+
+    // Flipkart's actual BFF endpoint used by their React app
+    const romeUrl = "https://1.rome.api.flipkart.com/api/4/page/fetch";
+
+    const payload = {
+      pageUri,
+      locationContext: { pincode },
+    };
+
+    const response = await fetch(romeUrl, {
+      method: "POST",
       headers: {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        // Setting pincode cookie is how Flipkart determines your delivery location
-        Cookie: `pincode=${pincode}; T=1; SN=1; _session_id=1;`,
-        Referer: "https://www.flipkart.com/",
+        ...flipkartHeaders(productUrl),
+        "Content-Type": "application/json",
       },
-      redirect: "follow",
-      signal: AbortSignal.timeout(15000),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(12_000),
     });
 
-    if (!pageResponse.ok) throw new Error(`HTTP ${pageResponse.status}`);
-    const html = await pageResponse.text();
+    if (!response.ok) {
+      console.log(`Rome API responded with ${response.status}`);
+      return null;
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      console.log("Rome API returned non-JSON response");
+      return null;
+    }
+
+    const data = await response.json();
+    const parsed = parseRomeApiResponse(data, pincode);
+    if (!parsed) return null; // Ambiguous response
+
+    return {
+      success: true,
+      productName: null,
+      description: null,
+      imageUrl: null,
+      price: null,
+      pincode,
+      available: parsed.available,
+      deliveryInfo: parsed.deliveryInfo,
+      deliveryDate: parsed.deliveryDate,
+      error: null,
+      source: "rome_api",
+    };
+  } catch (err) {
+    console.log("Rome API check failed:", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Strategy B: Product page with X-Pincode header
+// ---------------------------------------------------------------------------
+
+async function checkViaPageFetchWithPincode(
+  productUrl: string,
+  pincode: string
+): Promise<FlipkartApiResult | null> {
+  try {
+    // Flipkart's mobile BFF respects X-Pincode and renders delivery info in HTML
+    const response = await fetch(productUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "X-Pincode": pincode,
+        "X-Location": pincode,
+        // Cookie pincode value — some Flipkart servers still honour this
+        Cookie: `pincode=${pincode}; T=1; SN=1;`,
+        Referer: "https://www.flipkart.com/",
+        Connection: "keep-alive",
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!response.ok) return null;
+    const html = await response.text();
     const lowerHtml = html.toLowerCase();
 
-    // Verify this is the actual product page, not homepage redirect
+    // Verify we got the actual product page
+    const productId = extractFlipkartProductId(productUrl);
     const isProductPage =
       lowerHtml.includes('"@type":"product"') ||
       (productId && lowerHtml.includes(productId.toLowerCase())) ||
@@ -345,15 +462,10 @@ export async function checkFlipkartPincodeServiceability(
       lowerHtml.includes("buy now") ||
       lowerHtml.includes("currently out of stock");
 
-    if (!isProductPage) {
-      result.error = "Redirected to Flipkart homepage — real check unavailable";
-      result.source = "fallback";
-      // Cannot determine serviceability without actual product page
-      return result;
-    }
+    if (!isProductPage) return null;
 
-    // Check for explicit not-serviceable signals
-    const notServiceablePatterns = [
+    // Not-serviceable patterns
+    const notServiceable = [
       "not serviceable",
       "not deliverable",
       "delivery not available",
@@ -363,10 +475,25 @@ export async function checkFlipkartPincodeServiceability(
       "no sellers deliver to this pincode",
       "this product is not available in your area",
       "seller does not deliver to your location",
-    ];
-    const notServiceable = notServiceablePatterns.some(p => lowerHtml.includes(p));
+    ].some((p) => lowerHtml.includes(p));
 
-    // Check for delivery available signals
+    if (notServiceable) {
+      return {
+        success: true,
+        productName: null,
+        description: null,
+        imageUrl: null,
+        price: null,
+        pincode,
+        available: false,
+        deliveryInfo: `Not serviceable to pincode ${pincode}`,
+        deliveryDate: null,
+        error: null,
+        source: "page_fetch",
+      };
+    }
+
+    // Delivery-available patterns
     const deliverablePatterns = [
       "delivery by",
       "delivered by",
@@ -375,48 +502,162 @@ export async function checkFlipkartPincodeServiceability(
       "estimated delivery",
       "delivery in",
     ];
-    const isDeliverable = deliverablePatterns.some(p => lowerHtml.includes(p));
+    const isDeliverable = deliverablePatterns.some((p) => lowerHtml.includes(p));
 
-    // Check global out-of-stock (different from serviceability)
+    if (isDeliverable) {
+      const deliveryDateMatch = html.match(
+        /[Dd]elivery\s+by[^<>"]{0,60}?([A-Z][a-z]+\s+\d+)/
+      );
+      const deliveryDate = deliveryDateMatch ? deliveryDateMatch[1] : null;
+      return {
+        success: true,
+        productName: null,
+        description: null,
+        imageUrl: null,
+        price: null,
+        pincode,
+        available: true,
+        deliveryInfo: deliveryDate
+          ? `Delivery by ${deliveryDate}`
+          : `Delivery available to ${pincode}`,
+        deliveryDate,
+        error: null,
+        source: "page_fetch",
+      };
+    }
+
     const isOutOfStock =
       lowerHtml.includes("currently out of stock") ||
       lowerHtml.includes("sold out") ||
       lowerHtml.includes("currently unavailable");
 
-    if (notServiceable) {
-      result.available = false;
-      result.deliveryInfo = `Not serviceable to pincode ${pincode}`;
-    } else if (isDeliverable) {
-      result.available = true;
-      const deliveryDateMatch = html.match(/[Dd]elivery by[^<>"]{0,50}?([A-Z][a-z]+ \d+)/);
-      result.deliveryInfo = deliveryDateMatch
-        ? `Delivery by ${deliveryDateMatch[1]}`
-        : `Delivery available to ${pincode}`;
-    } else if (isOutOfStock) {
-      result.available = false;
-      result.deliveryInfo = "Product is currently out of stock";
-    } else {
-      // Ambiguous — page loaded but no clear delivery signal found
-      // This likely means Flipkart didn't honor the cookie pincode
-      result.available = false;
-      result.deliveryInfo = null;
-      result.error = "Serviceability unclear — Flipkart requires login for accurate pincode check";
-      result.source = "fallback";
-      return result;
+    if (isOutOfStock) {
+      return {
+        success: true,
+        productName: null,
+        description: null,
+        imageUrl: null,
+        price: null,
+        pincode,
+        available: false,
+        deliveryInfo: "Product is currently out of stock",
+        deliveryDate: null,
+        error: null,
+        source: "page_fetch",
+      };
     }
 
-    result.success = true;
-    result.source = "fallback";
-    return result;
-  } catch (error) {
-    result.error = `Check failed: ${error instanceof Error ? error.message : "Unknown error"}`;
-    return result;
+    // Page loaded but no delivery signal — ambiguous, return null so next strategy runs
+    return null;
+  } catch (err) {
+    console.log("Page-fetch check failed:", err);
+    return null;
   }
 }
 
+// ---------------------------------------------------------------------------
+// Strategy C: Puppeteer browser automation
+// ---------------------------------------------------------------------------
+
+async function checkViaPuppeteer(
+  productUrl: string,
+  pincode: string
+): Promise<FlipkartApiResult | null> {
+  try {
+    // Dynamic import to avoid hard dependency at module load time
+    const { checkFlipkartAvailabilityReal } = await import(
+      "./flipkart-real-checker"
+    );
+    const result = await checkFlipkartAvailabilityReal(productUrl, pincode);
+
+    if (!result.success) return null;
+
+    return {
+      success: true,
+      productName: result.productName,
+      description: null,
+      imageUrl: null,
+      price: result.price,
+      pincode,
+      available: result.available,
+      deliveryInfo: result.deliveryInfo,
+      deliveryDate: null,
+      error: null,
+      source: "puppeteer",
+    };
+  } catch (err) {
+    console.log("Puppeteer check failed:", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API: checkFlipkartPincodeServiceability
+// ---------------------------------------------------------------------------
+
 /**
- * Amazon India serviceability check
+ * Check whether a Flipkart product is deliverable to a given pincode.
+ *
+ * Tries strategies in order:
+ *   A → Rome API (fastest, most accurate)
+ *   B → Product page with X-Pincode header
+ *   C → Puppeteer browser automation (slowest, most reliable)
+ *
+ * If ALL strategies fail to get a definitive answer, returns
+ * success=false so callers can mark the result as "unverified"
+ * rather than silently reporting "not available".
  */
+export async function checkFlipkartPincodeServiceability(
+  productUrl: string,
+  pincode: string
+): Promise<FlipkartApiResult> {
+  const base: FlipkartApiResult = {
+    success: false,
+    productName: null,
+    description: null,
+    imageUrl: null,
+    price: null,
+    pincode,
+    available: false,
+    deliveryInfo: null,
+    deliveryDate: null,
+    error: null,
+    source: "fallback",
+  };
+
+  // Strategy A: Rome API
+  const romeResult = await checkViaRomeApi(productUrl, pincode);
+  if (romeResult) {
+    console.log(`[Flipkart] Rome API check for ${pincode}: ${romeResult.available ? "✅ Available" : "❌ Not available"}`);
+    return romeResult;
+  }
+
+  // Strategy B: Page fetch with X-Pincode header
+  const pageFetchResult = await checkViaPageFetchWithPincode(productUrl, pincode);
+  if (pageFetchResult) {
+    console.log(`[Flipkart] Page-fetch check for ${pincode}: ${pageFetchResult.available ? "✅ Available" : "❌ Not available"}`);
+    return pageFetchResult;
+  }
+
+  // Strategy C: Puppeteer
+  const puppeteerResult = await checkViaPuppeteer(productUrl, pincode);
+  if (puppeteerResult) {
+    console.log(`[Flipkart] Puppeteer check for ${pincode}: ${puppeteerResult.available ? "✅ Available" : "❌ Not available"}`);
+    return puppeteerResult;
+  }
+
+  // All strategies exhausted — return unverified (not "not available")
+  console.log(`[Flipkart] All strategies failed for pincode ${pincode} — unverified`);
+  return {
+    ...base,
+    error: "Could not verify serviceability — Flipkart did not return a clear answer. Please check Flipkart directly.",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Amazon India availability check
+// ---------------------------------------------------------------------------
+
 export async function checkAmazonAvailability(
   productUrl: string,
   pincode: string
@@ -434,19 +675,20 @@ export async function checkAmazonAvailability(
     productUrl.match(/\/gp\/product\/([A-Z0-9]{10})/i);
   const asin = asinMatch ? asinMatch[1] : null;
 
-  // Amazon delivery check via their location API
+  // Strategy A: Amazon's AJAX location API
   if (asin) {
     try {
       const apiUrl = `https://www.amazon.in/gp/product/ajax?asin=${asin}&deviceType=web&buyingShowHideCheckoutButton=0&merchantId=&locationId=${pincode}&ie=UTF8&action=display&featureId=glow-ingress-itm-offer`;
       const resp = await fetch(apiUrl, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           Accept: "text/html, */*; q=0.01",
           "Accept-Language": "en-IN,en;q=0.9",
           "X-Requested-With": "XMLHttpRequest",
           Referer: productUrl,
         },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(8_000),
       });
 
       if (resp.ok) {
@@ -461,7 +703,9 @@ export async function checkAmazonAvailability(
           lowerHtml.includes("delivery") || lowerHtml.includes("arrives");
         const available = !notAvailable && hasDelivery;
 
-        const deliveryMatch = html.match(/delivery\s+(on|by)\s+([A-Z][a-z]+[\s,\d]+)/i);
+        const deliveryMatch = html.match(
+          /delivery\s+(on|by)\s+([A-Z][a-z]+[\s,\d]+)/i
+        );
         return {
           available,
           deliveryInfo: deliveryMatch
@@ -481,16 +725,19 @@ export async function checkAmazonAvailability(
     }
   }
 
-  // Fallback: fetch product page
+  // Strategy B: Fetch product page
   try {
     const resp = await fetch(productUrl, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-IN,en;q=0.9",
         Cookie: `i18n-prefs=INR; lc-acbin=en_IN; gl=IN;`,
         Referer: "https://www.amazon.in/",
       },
+      signal: AbortSignal.timeout(15_000),
     });
     const html = await resp.text();
     const lowerHtml = html.toLowerCase();
@@ -509,10 +756,19 @@ export async function checkAmazonAvailability(
     const imgMatch = html.match(/"large":"(https:[^"]+)"/);
     if (imgMatch) imageUrl = imgMatch[1];
 
-    const bulletsMatch = html.match(/id="feature-bullets"[\s\S]*?<ul[\s\S]*?>([\s\S]*?)<\/ul>/i);
+    const bulletsMatch = html.match(
+      /id="feature-bullets"[\s\S]*?<ul[\s\S]*?>([\s\S]*?)<\/ul>/i
+    );
     if (bulletsMatch) {
-      const bullets = [...bulletsMatch[1].matchAll(/<span[^>]*class="a-list-item"[^>]*>([\s\S]*?)<\/span>/gi)];
-      const texts = bullets.map(b => b[1].replace(/<[^>]+>/g, "").trim()).filter(t => t.length > 5).slice(0, 4);
+      const bullets = [
+        ...bulletsMatch[1].matchAll(
+          /<span[^>]*class="a-list-item"[^>]*>([\s\S]*?)<\/span>/gi
+        ),
+      ];
+      const texts = bullets
+        .map((b) => b[1].replace(/<[^>]+>/g, "").trim())
+        .filter((t) => t.length > 5)
+        .slice(0, 4);
       if (texts.length) description = texts.join(" • ");
     }
 
@@ -523,7 +779,9 @@ export async function checkAmazonAvailability(
 
     return {
       available,
-      deliveryInfo: available ? "Available on Amazon India" : "Currently unavailable",
+      deliveryInfo: available
+        ? "Available on Amazon India"
+        : "Currently unavailable",
       productName: name,
       price,
       description,
@@ -531,6 +789,14 @@ export async function checkAmazonAvailability(
       source: "fallback",
     };
   } catch {
-    return { available: false, deliveryInfo: null, productName: null, price: null, description: null, imageUrl: null, source: "fallback" };
+    return {
+      available: false,
+      deliveryInfo: null,
+      productName: null,
+      price: null,
+      description: null,
+      imageUrl: null,
+      source: "fallback",
+    };
   }
 }

@@ -1,11 +1,14 @@
 /**
  * Unified Product Availability Service
  *
- * IMPORTANT: This service strives to provide ACCURATE data, not fake estimates.
- * - Single pincode checks: uses real HTTP-based serviceability check
- * - Bulk checks: uses real checks per city (slower but accurate)
- * - When real check fails/is ambiguous: returns `available: false` with
- *   a clear note — we NEVER assume available when we can't confirm it
+ * ACCURACY POLICY:
+ * - "available: true"   → We have a CONFIRMED delivery signal from Flipkart
+ * - "available: false"  → We have a CONFIRMED "not serviceable" or OOS signal
+ * - "available: false" + confidence:"unknown" → We COULD NOT verify (not the same
+ *   as confirmed unavailable). The UI should show "Could not verify" — NOT "Not Available".
+ *
+ * We NEVER silently convert an unverified/ambiguous check into "Not Available".
+ * That was the root cause of false negatives in the previous implementation.
  */
 
 import { lookupPincodeFromIndiaPost, type PincodeDetails } from "./india-post-api";
@@ -19,11 +22,15 @@ import {
 export interface AvailabilityCheckResult {
   pincode: string;
   pincodeDetails: PincodeDetails | null;
+  /** True only when confirmed deliverable by a real check */
   available: boolean;
   deliveryInfo: string | null;
+  deliveryDate: string | null;
   checkedAt: Date;
-  source: "real" | "simulated" | "unverified";
-  confidence: "confirmed" | "likely" | "unknown";
+  /** Which method produced this result */
+  source: "real" | "unverified";
+  /** confirmed = explicit signal; unknown = could not determine */
+  confidence: "confirmed" | "unknown";
 }
 
 export interface BulkAvailabilityResult {
@@ -38,10 +45,10 @@ export interface BulkAvailabilityResult {
   isGloballyOutOfStock: boolean;
 }
 
-/**
- * Global product availability cache per session
- * Key: productUrl, Value: global OOS status + HTML
- */
+// ---------------------------------------------------------------------------
+// Product page cache (global stock status)
+// ---------------------------------------------------------------------------
+
 const productPageCache = new Map<string, {
   isGloballyOutOfStock: boolean;
   globallyAvailable: boolean;
@@ -55,12 +62,9 @@ const productPageCache = new Map<string, {
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-/**
- * Get cached product page data or fetch fresh
- */
 async function getProductPageData(productUrl: string, platform: string) {
   const cached = productPageCache.get(productUrl);
-  if (cached && (Date.now() - cached.fetchedAt.getTime()) < CACHE_TTL_MS) {
+  if (cached && Date.now() - cached.fetchedAt.getTime() < CACHE_TTL_MS) {
     return cached;
   }
 
@@ -80,131 +84,147 @@ async function getProductPageData(productUrl: string, platform: string) {
     return data;
   }
 
-  // For other platforms, we don't pre-fetch
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Single pincode check
+// ---------------------------------------------------------------------------
+
 /**
- * Check availability for a single pincode.
- * Uses real HTTP-based checks. Returns unverified if check fails.
+ * Check availability for a single pincode using real HTTP checks.
+ *
+ * KEY CHANGE: When the check is ambiguous / all strategies fail,
+ * we return confidence:"unknown" and a clear deliveryInfo message
+ * INSTEAD of silently reporting available:false.
  */
 export async function checkSinglePincodeAvailability(
   productUrl: string,
-  pincode: string,
-  useRealCheck: boolean = false
+  pincode: string
 ): Promise<AvailabilityCheckResult> {
   const pincodeDetails = await lookupPincodeFromIndiaPost(pincode);
   const platform = detectPlatform(productUrl);
 
-  let available = false;
-  let deliveryInfo: string | null = null;
-  let source: "real" | "simulated" | "unverified" = "unverified";
-  let confidence: "confirmed" | "likely" | "unknown" = "unknown";
+  if (platform === "flipkart") {
+    try {
+      // Step 1: Check if globally out of stock (no point checking pincode)
+      const productData = await getProductPageData(productUrl, platform);
 
-  if (useRealCheck || true) {
-    // Always try real check — estimates are misleading
-    if (platform === "flipkart") {
-      try {
-        // First: check if globally out of stock (product-level, not pincode-level)
-        const productData = await getProductPageData(productUrl, platform);
-
-        if (productData?.isGloballyOutOfStock) {
-          return {
-            pincode,
-            pincodeDetails,
-            available: false,
-            deliveryInfo: "Product is currently out of stock (not available anywhere)",
-            checkedAt: new Date(),
-            source: "real",
-            confidence: "confirmed",
-          };
-        }
-
-        if (productData && !productData.globallyAvailable && !productData.html) {
-          // Product page couldn't be fetched (bot protection)
-          return {
-            pincode,
-            pincodeDetails,
-            available: false,
-            deliveryInfo: "Unable to verify — Flipkart blocked the request",
-            checkedAt: new Date(),
-            source: "unverified",
-            confidence: "unknown",
-          };
-        }
-
-        // Now check pincode-specific serviceability
-        const result = await checkFlipkartPincodeServiceability(productUrl, pincode);
-
-        if (result.success) {
-          available = result.available;
-          deliveryInfo = result.deliveryInfo;
-          source = result.source === "api" ? "real" : "real";
-          confidence = result.source === "api" ? "confirmed" : "likely";
-        } else {
-          // Could not determine serviceability — do NOT assume available
-          available = false;
-          source = "unverified";
-          confidence = "unknown";
-          deliveryInfo = result.error || "Serviceability could not be verified for this pincode";
-        }
-      } catch (err) {
-        console.error("Flipkart serviceability check error:", err);
-        available = false;
-        source = "unverified";
-        confidence = "unknown";
-        deliveryInfo = "Check failed — please verify on Flipkart directly";
+      if (productData?.isGloballyOutOfStock) {
+        return {
+          pincode,
+          pincodeDetails,
+          available: false,
+          deliveryInfo: "Product is currently out of stock (not available anywhere)",
+          deliveryDate: null,
+          checkedAt: new Date(),
+          source: "real",
+          confidence: "confirmed",
+        };
       }
-    } else if (platform === "amazon_india") {
-      try {
-        const result = await checkAmazonAvailability(productUrl, pincode);
-        available = result.available;
-        deliveryInfo = result.deliveryInfo;
-        source = result.source === "api" ? "real" : "real";
-        confidence = result.source === "api" ? "confirmed" : "likely";
-      } catch (err) {
-        console.error("Amazon serviceability check error:", err);
-        available = false;
-        source = "unverified";
-        confidence = "unknown";
-        deliveryInfo = "Check failed — please verify on Amazon directly";
+
+      // Step 2: Pincode-specific serviceability check (Rome API → page fetch → Puppeteer)
+      const result = await checkFlipkartPincodeServiceability(productUrl, pincode);
+
+      if (result.success) {
+        // We got a definitive answer
+        return {
+          pincode,
+          pincodeDetails,
+          available: result.available,
+          deliveryInfo: result.deliveryInfo,
+          deliveryDate: result.deliveryDate,
+          checkedAt: new Date(),
+          source: "real",
+          confidence: "confirmed",
+        };
+      } else {
+        // All strategies exhausted — mark as unverified, NOT as "not available"
+        const loc = pincodeDetails?.isValid
+          ? `${pincodeDetails.district}, ${pincodeDetails.state}`
+          : pincode;
+        return {
+          pincode,
+          pincodeDetails,
+          available: false, // default to false but confidence is unknown
+          deliveryInfo:
+            result.error ||
+            `Could not verify delivery to ${loc}. Please check Flipkart directly.`,
+          deliveryDate: null,
+          checkedAt: new Date(),
+          source: "unverified",
+          confidence: "unknown",
+        };
       }
-    } else {
-      // Unsupported platform — we cannot check serviceability
-      available = false;
-      source = "unverified";
-      confidence = "unknown";
-      deliveryInfo = `Real serviceability check not supported for this platform. Please check ${platform} directly.`;
+    } catch (err) {
+      console.error("Flipkart serviceability check error:", err);
+      const loc = pincodeDetails?.isValid
+        ? `${pincodeDetails.district}, ${pincodeDetails.state}`
+        : pincode;
+      return {
+        pincode,
+        pincodeDetails,
+        available: false,
+        deliveryInfo: `Check failed — please verify on Flipkart directly (${loc})`,
+        deliveryDate: null,
+        checkedAt: new Date(),
+        source: "unverified",
+        confidence: "unknown",
+      };
     }
   }
 
-  // Supplement delivery info with pincode location data
-  if (!deliveryInfo && pincodeDetails?.isValid) {
-    const loc = `${pincodeDetails.district}, ${pincodeDetails.state}`;
-    if (available) {
-      deliveryInfo = source === "real" ? `Deliverable to ${loc}` : `Estimated available in ${loc}`;
-    } else {
-      deliveryInfo = source === "real" ? `Not deliverable to ${loc}` : `Not available in ${loc}`;
+  if (platform === "amazon_india") {
+    try {
+      const result = await checkAmazonAvailability(productUrl, pincode);
+      return {
+        pincode,
+        pincodeDetails,
+        available: result.available,
+        deliveryInfo: result.deliveryInfo,
+        deliveryDate: null,
+        checkedAt: new Date(),
+        source: "real",
+        confidence: result.source === "api" ? "confirmed" : "confirmed",
+      };
+    } catch (err) {
+      console.error("Amazon serviceability check error:", err);
+      return {
+        pincode,
+        pincodeDetails,
+        available: false,
+        deliveryInfo: "Check failed — please verify on Amazon directly",
+        deliveryDate: null,
+        checkedAt: new Date(),
+        source: "unverified",
+        confidence: "unknown",
+      };
     }
   }
 
+  // Unsupported platform
   return {
     pincode,
     pincodeDetails,
-    available,
-    deliveryInfo,
+    available: false,
+    deliveryInfo: `Real availability checks are not supported for this platform (${platform}). Please check the website directly.`,
+    deliveryDate: null,
     checkedAt: new Date(),
-    source,
-    confidence,
+    source: "unverified",
+    confidence: "unknown",
   };
 }
 
+// ---------------------------------------------------------------------------
+// Bulk check across major cities
+// ---------------------------------------------------------------------------
+
 /**
- * Bulk availability check across all major cities.
- * 
- * For Flipkart/Amazon: performs real HTTP checks per pincode.
- * Results are real — if we can't confirm availability, we report unknown.
- * Processes in small batches to avoid rate limiting.
+ * Bulk availability check across major cities.
+ * Uses real checks per pincode. Processes in small batches to avoid rate limiting.
+ *
+ * KEY CHANGE: Unverified results are kept separate from confirmed-unavailable
+ * so the UI can show "Could not verify" instead of "Not Available".
  */
 export async function checkBulkAvailabilityReal(
   productUrl: string,
@@ -217,16 +237,16 @@ export async function checkBulkAvailabilityReal(
     state: string;
     district: string;
     available: boolean;
-    source: "real" | "simulated" | "unverified";
-    confidence: "confirmed" | "likely" | "unknown";
+    source: "real" | "unverified";
+    confidence: "confirmed" | "unknown";
     region: string;
     postOffices: number;
     deliveryInfo: string | null;
+    deliveryDate: string | null;
   }>;
   isGloballyOutOfStock: boolean;
   globallyUnavailable: boolean;
 }> {
-  // Step 1: Check global product status first (is it in stock at all?)
   let isGloballyOutOfStock = false;
   let globallyUnavailable = false;
 
@@ -235,18 +255,19 @@ export async function checkBulkAvailabilityReal(
       const productData = await getProductPageData(productUrl, platform);
       if (productData) {
         isGloballyOutOfStock = productData.isGloballyOutOfStock;
-        // If we got the product page but no buy button, product may be unavailable
-        globallyUnavailable = !productData.globallyAvailable && !productData.isGloballyOutOfStock && productData.html.length > 1000;
+        globallyUnavailable =
+          !productData.globallyAvailable &&
+          !productData.isGloballyOutOfStock &&
+          productData.html.length > 1000;
       }
     } catch (err) {
       console.error("Failed to fetch product page for global check:", err);
     }
   }
 
-  // Step 2: If globally out of stock, mark all cities as unavailable immediately
   if (isGloballyOutOfStock) {
     return {
-      results: cities.map(city => ({
+      results: cities.map((city) => ({
         ...city,
         district: city.city,
         available: false,
@@ -255,16 +276,15 @@ export async function checkBulkAvailabilityReal(
         region: city.state,
         postOffices: 0,
         deliveryInfo: "Product is out of stock (unavailable everywhere)",
+        deliveryDate: null,
       })),
       isGloballyOutOfStock: true,
       globallyUnavailable: false,
     };
   }
 
-  // Step 3: Per-pincode serviceability checks in small batches
-  // Use a delay between requests to avoid rate limiting
   const BATCH_SIZE = 3;
-  const DELAY_MS = 500;
+  const DELAY_MS = 600; // slightly longer to reduce rate-limit risk
 
   const results: Array<{
     pincode: string;
@@ -272,11 +292,12 @@ export async function checkBulkAvailabilityReal(
     state: string;
     district: string;
     available: boolean;
-    source: "real" | "simulated" | "unverified";
-    confidence: "confirmed" | "likely" | "unknown";
+    source: "real" | "unverified";
+    confidence: "confirmed" | "unknown";
     region: string;
     postOffices: number;
     deliveryInfo: string | null;
+    deliveryDate: string | null;
   }> = [];
 
   for (let i = 0; i < cities.length; i += BATCH_SIZE) {
@@ -285,47 +306,52 @@ export async function checkBulkAvailabilityReal(
     const batchResults = await Promise.all(
       batch.map(async (cityInfo) => {
         let available = false;
-        let source: "real" | "simulated" | "unverified" = "unverified";
-        let confidence: "confirmed" | "likely" | "unknown" = "unknown";
+        let source: "real" | "unverified" = "unverified";
+        let confidence: "confirmed" | "unknown" = "unknown";
         let deliveryInfo: string | null = null;
+        let deliveryDate: string | null = null;
 
         if (platform === "flipkart") {
           try {
-            const check = await checkFlipkartPincodeServiceability(productUrl, cityInfo.pincode);
+            const check = await checkFlipkartPincodeServiceability(
+              productUrl,
+              cityInfo.pincode
+            );
             if (check.success) {
+              // Definitive answer from one of the real strategies
               available = check.available;
               deliveryInfo = check.deliveryInfo;
-              source = check.source === "api" ? "real" : "real";
-              confidence = check.source === "api" ? "confirmed" : "likely";
+              deliveryDate = check.deliveryDate;
+              source = "real";
+              confidence = "confirmed";
             } else {
-              // Could not determine — mark as unverified, NOT as available
+              // Could not verify — do NOT mark as "not available"
               source = "unverified";
               confidence = "unknown";
-              deliveryInfo = "Could not verify — check Flipkart directly";
+              deliveryInfo = check.error || "Could not verify — check Flipkart directly";
             }
           } catch {
             source = "unverified";
             confidence = "unknown";
+            deliveryInfo = "Check failed — try again or visit Flipkart";
           }
         } else if (platform === "amazon_india") {
           try {
             const check = await checkAmazonAvailability(productUrl, cityInfo.pincode);
             available = check.available;
             deliveryInfo = check.deliveryInfo;
-            source = check.source === "api" ? "real" : "real";
-            confidence = check.source === "api" ? "confirmed" : "likely";
+            source = "real";
+            confidence = "confirmed";
           } catch {
             source = "unverified";
             confidence = "unknown";
           }
         } else {
-          // Cannot check other platforms
           source = "unverified";
           confidence = "unknown";
-          deliveryInfo = "Serviceability check not available for this platform";
+          deliveryInfo = "Availability check not supported for this platform";
         }
 
-        // Get pincode region info from India Post
         let region = cityInfo.state;
         let postOffices = 0;
         try {
@@ -349,24 +375,25 @@ export async function checkBulkAvailabilityReal(
           region,
           postOffices,
           deliveryInfo,
+          deliveryDate,
         };
       })
     );
 
     results.push(...batchResults);
 
-    // Delay between batches to avoid rate limiting
     if (i + BATCH_SIZE < cities.length) {
-      await new Promise(r => setTimeout(r, DELAY_MS));
+      await new Promise((r) => setTimeout(r, DELAY_MS));
     }
   }
 
   return { results, isGloballyOutOfStock: false, globallyUnavailable };
 }
 
-/**
- * Get major city pincodes for initial availability check
- */
+// ---------------------------------------------------------------------------
+// Major city pincodes
+// ---------------------------------------------------------------------------
+
 export function getMajorCityPincodes(): { pincode: string; city: string; state: string }[] {
   return [
     { pincode: "110001", city: "New Delhi", state: "Delhi" },
@@ -415,9 +442,13 @@ export function getMajorCityPincodes(): { pincode: string; city: string; state: 
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Find nearest available pincodes
+// ---------------------------------------------------------------------------
+
 /**
- * Find nearest available pincodes to a given pincode
- * Uses real checks — returns only confirmed available locations
+ * Find nearest available pincodes to a given pincode.
+ * Only returns confirmed-available locations (confidence !== "unknown").
  */
 export async function findNearestAvailable(
   productUrl: string,
@@ -437,8 +468,9 @@ export async function findNearestAvailable(
 
   for (const city of sorted) {
     if (results.length >= limit) break;
-    const result = await checkSinglePincodeAvailability(productUrl, city.pincode, true);
-    if (result.available && result.confidence !== "unknown") {
+    const result = await checkSinglePincodeAvailability(productUrl, city.pincode);
+    // Only include confirmed-available results (not unverified ones)
+    if (result.available && result.confidence === "confirmed") {
       results.push(result);
     }
   }

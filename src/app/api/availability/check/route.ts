@@ -23,7 +23,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Ensure product exists in DB
+    // Upsert product record
     let productRecord = await db
       .select()
       .from(products)
@@ -45,11 +45,22 @@ export async function POST(request: Request) {
         .returning();
     } else {
       const prod = productRecord[0];
-      if ((imageUrl && !prod.imageUrl) || (price && !prod.price) || (description && !prod.description) || (productName && productName !== "Unknown Product" && productName !== prod.name)) {
+      const shouldUpdate =
+        (imageUrl && !prod.imageUrl) ||
+        (price && !prod.price) ||
+        (description && !prod.description) ||
+        (productName &&
+          productName !== "Unknown Product" &&
+          productName !== prod.name);
+
+      if (shouldUpdate) {
         productRecord = await db
           .update(products)
           .set({
-            name: productName && productName !== "Unknown Product" ? productName : prod.name,
+            name:
+              productName && productName !== "Unknown Product"
+                ? productName
+                : prod.name,
             imageUrl: imageUrl || prod.imageUrl,
             price: price || prod.price,
             description: description || prod.description,
@@ -62,46 +73,140 @@ export async function POST(request: Request) {
 
     const product = productRecord[0];
 
-    // Check all major cities
+    // ── Check all major cities ──────────────────────────────────────────────
     if (checkAll) {
       const majorCities = getMajorCityPincodes();
+
       const results: Array<{
         pincode: string;
         city: string;
         state: string;
         district: string;
         available: boolean;
+        confidence: string;
+        source: string;
+        deliveryInfo: string | null;
+        deliveryDate: string | null;
         region: string;
         postOffices: number;
       }> = [];
 
-      // Process in batches for performance
+      const failedCities: string[] = [];
+
       for (const cityInfo of majorCities) {
-        const result = await checkSinglePincodeAvailability(
-          productUrl,
-          cityInfo.pincode
+        try {
+          const result = await checkSinglePincodeAvailability(
+            productUrl,
+            cityInfo.pincode
+          );
+
+          const pincodeData = result.pincodeDetails;
+
+          results.push({
+            pincode: cityInfo.pincode,
+            city: cityInfo.city,
+            state: pincodeData?.state || cityInfo.state,
+            district: pincodeData?.district || cityInfo.city,
+            available: result.available,
+            confidence: result.confidence,
+            source: result.source,
+            deliveryInfo: result.deliveryInfo,
+            deliveryDate: result.deliveryDate,
+            region: pincodeData?.region || "Unknown",
+            postOffices: pincodeData?.postOffices.length || 0,
+          });
+
+          // Only persist confirmed results to avoid polluting DB with noise
+          if (result.confidence === "confirmed") {
+            await db
+              .insert(availability)
+              .values({
+                productId: product.id,
+                pincode: cityInfo.pincode,
+                city: cityInfo.city,
+                state: pincodeData?.state || cityInfo.state,
+                available: result.available,
+                lastChecked: new Date(),
+              })
+              .onConflictDoUpdate({
+                target: [availability.productId, availability.pincode],
+                set: {
+                  available: result.available,
+                  lastChecked: new Date(),
+                },
+              });
+          }
+        } catch (error) {
+          failedCities.push(cityInfo.city);
+          console.error(`Failed to check ${cityInfo.city}:`, error);
+        }
+      }
+
+      // Separate confirmed-available, confirmed-unavailable, and unverified
+      const availableResults = results.filter(
+        (r) => r.available && r.confidence === "confirmed"
+      );
+      const unavailableResults = results.filter(
+        (r) => !r.available && r.confidence === "confirmed"
+      );
+      const unverifiedResults = results.filter(
+        (r) => r.confidence === "unknown"
+      );
+
+      return Response.json({
+        product,
+        totalChecked: results.length + failedCities.length,
+        availableCount: availableResults.length,
+        unavailableCount: unavailableResults.length,
+        unverifiedCount: unverifiedResults.length,
+        available: availableResults,
+        unavailable: unavailableResults,
+        unverified: unverifiedResults,
+        note: failedCities.length
+          ? `Skipped due to error: ${failedCities.join(", ")}`
+          : undefined,
+      });
+    }
+
+    // ── Single pincode check ────────────────────────────────────────────────
+    if (pincode) {
+      if (!/^\d{6}$/.test(pincode)) {
+        return Response.json(
+          { error: "Invalid pincode. Must be 6 digits." },
+          { status: 400 }
         );
+      }
 
-        const pincodeData = result.pincodeDetails;
+      const pincodeDetails = await lookupPincodeFromIndiaPost(pincode);
 
-        results.push({
-          pincode: cityInfo.pincode,
-          city: cityInfo.city,
-          state: pincodeData?.state || cityInfo.state,
-          district: pincodeData?.district || cityInfo.city,
-          available: result.available,
-          region: pincodeData?.region || "Unknown",
-          postOffices: pincodeData?.postOffices.length || 0,
+      if (!pincodeDetails?.isValid) {
+        return Response.json({
+          product,
+          result: {
+            pincode,
+            city: "Unknown",
+            state: "Unknown",
+            available: false,
+            confidence: "unknown",
+            isValidPincode: false,
+          },
+          error: "Invalid or unknown pincode. Please check and try again.",
+          nearestAvailable: [],
         });
+      }
 
-        // Store in DB
+      const result = await checkSinglePincodeAvailability(productUrl, pincode);
+
+      // Only persist confirmed results to DB
+      if (result.confidence === "confirmed") {
         await db
           .insert(availability)
           .values({
             productId: product.id,
-            pincode: cityInfo.pincode,
-            city: cityInfo.city,
-            state: pincodeData?.state || cityInfo.state,
+            pincode,
+            city:
+              pincodeDetails.deliveryPostOffice?.Name || pincodeDetails.district,
+            state: pincodeDetails.state,
             available: result.available,
             lastChecked: new Date(),
           })
@@ -114,83 +219,23 @@ export async function POST(request: Request) {
           });
       }
 
-      const availableResults = results.filter((r) => r.available);
-      const unavailableResults = results.filter((r) => !r.available);
-
-      return Response.json({
-        product,
-        totalChecked: results.length,
-        availableCount: availableResults.length,
-        unavailableCount: unavailableResults.length,
-        available: availableResults,
-        unavailable: unavailableResults,
-        note: "Availability is simulated. For real data, integrate with Flipkart/Amazon APIs or use browser automation.",
-      });
-    }
-
-    // Check single pincode
-    if (pincode) {
-      // Validate pincode format
-      if (!/^\d{6}$/.test(pincode)) {
-        return Response.json(
-          { error: "Invalid pincode. Must be 6 digits." },
-          { status: 400 }
-        );
-      }
-
-      // Get REAL pincode details from India Post
-      const pincodeDetails = await lookupPincodeFromIndiaPost(pincode);
-
-      if (!pincodeDetails?.isValid) {
-        return Response.json({
-          product,
-          result: {
-            pincode,
-            city: "Unknown",
-            state: "Unknown",
-            available: false,
-            isValidPincode: false,
-          },
-          error: "Invalid or unknown pincode. Please check and try again.",
-          nearestAvailable: [],
-        });
-      }
-
-      const result = await checkSinglePincodeAvailability(productUrl, pincode, true);
-
-
-      // Store in DB
-      await db
-        .insert(availability)
-        .values({
-          productId: product.id,
-          pincode: pincode,
-          city: pincodeDetails.deliveryPostOffice?.Name || pincodeDetails.district,
-          state: pincodeDetails.state,
-          available: result.available,
-          lastChecked: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: [availability.productId, availability.pincode],
-          set: {
-            available: result.available,
-            lastChecked: new Date(),
-          },
-        });
-
-      // Find nearest available locations
       const nearest = await findNearestAvailable(productUrl, pincode, 5);
 
       return Response.json({
         product,
         result: {
           pincode,
-          city: pincodeDetails.deliveryPostOffice?.Name || pincodeDetails.district,
+          city:
+            pincodeDetails.deliveryPostOffice?.Name || pincodeDetails.district,
           state: pincodeDetails.state,
           district: pincodeDetails.district,
           region: pincodeDetails.region,
           block: pincodeDetails.block,
           available: result.available,
+          confidence: result.confidence,
+          source: result.source,
+          deliveryInfo: result.deliveryInfo,
+          deliveryDate: result.deliveryDate,
           isValidPincode: true,
           postOffices: pincodeDetails.postOffices.slice(0, 5).map((po) => ({
             name: po.Name,
@@ -203,8 +248,9 @@ export async function POST(request: Request) {
           city: n.pincodeDetails?.district || "Unknown",
           state: n.pincodeDetails?.state || "Unknown",
           available: n.available,
+          deliveryInfo: n.deliveryInfo,
+          deliveryDate: n.deliveryDate,
         })),
-        note: "Availability is simulated. For real data, connect Flipkart/Amazon APIs.",
       });
     }
 

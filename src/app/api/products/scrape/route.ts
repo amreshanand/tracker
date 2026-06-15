@@ -102,7 +102,7 @@ function extractFromHtml(html: string, platform: string) {
     }
 
     // Try Flipkart's __INITIAL_STATE__ data for product details
-    const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{.+?\});?\s*<\/script>/s);
+    const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]+?\});?\s*<\/script>/);
     if (stateMatch) {
       try {
         const state = JSON.parse(stateMatch[1]);

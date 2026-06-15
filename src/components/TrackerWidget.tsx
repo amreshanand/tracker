@@ -12,7 +12,10 @@ interface AvailabilityResult {
   region: string;
   isValidPincode?: boolean;
   postOffices?: Array<{ name: string; type: string; delivery: boolean }>;
-  source?: "real" | "simulated";
+  source?: "real" | "unverified" | "simulated" | string;
+  confidence?: "confirmed" | "unknown" | string;
+  deliveryInfo?: string | null;
+  deliveryDate?: string | null;
 }
 
 interface CheckResult {
@@ -25,8 +28,10 @@ interface CheckResult {
   totalChecked?: number;
   availableCount?: number;
   unavailableCount?: number;
+  unverifiedCount?: number;
   available?: AvailabilityResult[];
   unavailable?: AvailabilityResult[];
+  unverified?: AvailabilityResult[];
   result?: AvailabilityResult;
   nearestAvailable?: AvailabilityResult[];
 }
@@ -241,11 +246,16 @@ export function TrackerWidget() {
 
   const availableResults = results?.available || [];
   const unavailableResults = results?.unavailable || [];
+  const unverifiedResults = results?.unverified || [];
 
   const regions = [
     "all",
     ...Array.from(
-      new Set([...availableResults, ...unavailableResults].map((r) => r.region))
+      new Set(
+        [...availableResults, ...unavailableResults, ...unverifiedResults]
+          .map((r) => r.region)
+          .filter(Boolean)
+      )
     ),
   ];
 
@@ -258,6 +268,11 @@ export function TrackerWidget() {
     regionFilter === "all"
       ? unavailableResults
       : unavailableResults.filter((r) => r.region === regionFilter);
+
+  const filteredUnverified =
+    regionFilter === "all"
+      ? unverifiedResults
+      : unverifiedResults.filter((r) => r.region === regionFilter);
 
   return (
     <section id="tracker" className="py-16 md:py-24 bg-white">
@@ -609,19 +624,27 @@ export function TrackerWidget() {
                     </h3>
                     <div
                       className={`p-6 rounded-xl flex items-center gap-4 ${
-                        results.result.available
+                        results.result.confidence === 'unknown'
+                          ? "bg-amber-50 border border-amber-400/30"
+                          : results.result.available
                           ? "bg-success-50 border border-success-400/30"
                           : "bg-danger-50 border border-danger-400/30"
                       }`}
                     >
                       <div
                         className={`w-12 h-12 rounded-full flex items-center justify-center ${
-                          results.result.available
+                          results.result.confidence === 'unknown'
+                            ? "bg-amber-500"
+                            : results.result.available
                             ? "bg-success-500"
                             : "bg-danger-500"
                         }`}
                       >
-                        {results.result.available ? (
+                        {results.result.confidence === 'unknown' ? (
+                          <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                          </svg>
+                        ) : results.result.available ? (
                           <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
                           </svg>
@@ -635,27 +658,44 @@ export function TrackerWidget() {
                         <div className="flex items-center justify-between">
                           <p
                             className={`font-bold text-lg ${
-                              results.result.available
+                              results.result.confidence === 'unknown'
+                                ? "text-amber-700"
+                                : results.result.available
                                 ? "text-success-700"
                                 : "text-danger-600"
                             }`}
                           >
-                            {results.result.available
+                            {results.result.confidence === 'unknown'
+                              ? "⚠️ Could Not Verify"
+                              : results.result.available
                               ? "✅ Deliverable!"
                               : "❌ Not Deliverable"}
                           </p>
                           <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded uppercase ${
                             results.result.source === 'real' 
                               ? 'bg-blue-100 text-blue-700 border border-blue-200' 
+                              : results.result.source === 'unverified'
+                              ? 'bg-amber-100 text-amber-700 border border-amber-200'
                               : 'bg-slate-100 text-slate-500 border border-slate-200'
                           }`}>
-                            {results.result.source === 'real' ? 'Verified ✓' : 'Estimated'}
+                            {results.result.source === 'real' ? 'Verified ✓' : results.result.source === 'unverified' ? 'Unverified' : 'Estimated'}
                           </span>
                         </div>
                         <p className="text-sm text-slate-600">
                           {results.result.city}, {results.result.state} -{" "}
                           {results.result.pincode}
                         </p>
+                        {results.result.deliveryInfo && (
+                          <p className={`text-xs mt-1.5 font-semibold ${
+                            results.result.confidence === 'unknown'
+                              ? 'text-amber-600'
+                              : results.result.available
+                              ? 'text-success-600'
+                              : 'text-danger-500'
+                          }`}>
+                            {results.result.deliveryInfo}
+                          </p>
+                        )}
                       </div>
                     </div>
 
@@ -705,7 +745,7 @@ export function TrackerWidget() {
                           {results.product.name} • {getPlatformLabel(results.product.platform)}
                         </p>
                       </div>
-                      <div className="flex gap-3">
+                      <div className="flex flex-wrap gap-3">
                         <div className="px-4 py-2 bg-success-50 rounded-xl border border-success-400/20">
                           <span className="text-2xl font-bold text-success-600">
                             {results.availableCount}
@@ -722,6 +762,16 @@ export function TrackerWidget() {
                             Unavailable
                           </span>
                         </div>
+                        {results.unverifiedCount !== undefined && results.unverifiedCount > 0 && (
+                          <div className="px-4 py-2 bg-amber-50 rounded-xl border border-amber-400/20">
+                            <span className="text-2xl font-bold text-amber-600">
+                              {results.unverifiedCount}
+                            </span>
+                            <span className="text-xs text-amber-600 ml-1 font-medium">
+                              Unverified
+                            </span>
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -801,6 +851,36 @@ export function TrackerWidget() {
                                 </span>
                               </div>
                               <span className="text-xs font-mono text-slate-400 bg-slate-100 px-2 py-0.5 rounded">
+                                {loc.pincode}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Unverified locations */}
+                    {filteredUnverified.length > 0 && (
+                      <div className="mt-6">
+                        <h4 className="text-sm font-bold text-amber-600 uppercase tracking-wider mb-3 flex items-center gap-2">
+                          <span className="w-2 h-2 bg-amber-400 rounded-full" />
+                          Unverified / Ambiguous ({filteredUnverified.length})
+                        </h4>
+                        <div className="grid sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                          {filteredUnverified.map((loc) => (
+                            <div
+                              key={loc.pincode}
+                              className="flex items-center justify-between p-3 bg-amber-50/20 border border-amber-200/45 rounded-xl"
+                            >
+                              <div className="flex items-center gap-2">
+                                <svg className="w-4 h-4 text-amber-500" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                                </svg>
+                                <span className="font-medium text-amber-700 text-sm">
+                                  {loc.city}
+                                </span>
+                              </div>
+                              <span className="text-xs font-mono text-amber-600 bg-amber-50 px-2 py-0.5 rounded">
                                 {loc.pincode}
                               </span>
                             </div>

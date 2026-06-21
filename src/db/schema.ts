@@ -109,6 +109,9 @@ export const userUsage = pgTable("user_usage", {
   activeAlerts: integer("active_alerts").default(0).notNull(),
   totalAlertsCreated: integer("total_alerts_created").default(0).notNull(),
   totalNotificationsSent: integer("total_notifications_sent").default(0).notNull(),
+  bounced: boolean("bounced").default(false).notNull(),
+  bounceReason: text("bounce_reason"),
+  bouncedAt: timestamp("bounced_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

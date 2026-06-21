@@ -8,7 +8,7 @@ import {
   getMajorCityPincodes,
   findNearestAvailable,
 } from "@/lib/availability-service";
-import { apiLimiter, getClientIp } from "@/lib/rate-limit";
+import { apiLimiter, productLimiter, getClientIp } from "@/lib/rate-limit";
 import { isCircuitAvailable, recordSuccess, recordFailure } from "@/lib/circuit-breaker";
 import { eq } from "drizzle-orm";
 
@@ -97,6 +97,16 @@ export async function POST(request: Request) {
           platform,
         });
       }
+    }
+
+    // Per-product rate limiting
+    const productLimitKey = `product:${product.id}:${ip}`;
+    const { allowed: prodAllowed, retryAfter: prodRetryAfter } = await productLimiter.check(productLimitKey);
+    if (!prodAllowed) {
+      return Response.json(
+        { error: `Too many requests for this product. Try again in ${prodRetryAfter}s.` },
+        { status: 429, headers: { "Retry-After": String(prodRetryAfter) } }
+      );
     }
 
     // Data freshness: include metadata about last scrape

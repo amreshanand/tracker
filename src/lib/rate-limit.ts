@@ -45,7 +45,8 @@ export function createRateLimiter(windowMs = 60_000, maxRequests = 15) {
 
         return { allowed: true, retryAfter: 0 };
       } catch {
-        return { allowed: true, retryAfter: 0 };
+        // Fail CLOSED — on DB error, block the request to prevent abuse bypass
+        return { allowed: false, retryAfter: 60 };
       }
     },
   };
@@ -54,6 +55,7 @@ export function createRateLimiter(windowMs = 60_000, maxRequests = 15) {
 export const apiLimiter = createRateLimiter(60_000, 15);
 export const emailAlertLimiter = createRateLimiter(60_000, 5);
 export const cronLimiter = createRateLimiter(60_000, 3);
+export const productLimiter = createRateLimiter(60_000, 10);
 
 export function getClientIp(request: Request): string {
   return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()

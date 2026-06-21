@@ -2,7 +2,7 @@ import { db } from "@/db";
 import { alerts, products, notificationLog, analyticsEvents, userUsage, deadLetterQueue } from "@/db/schema";
 import { checkSinglePincodeAvailability } from "@/lib/availability-service";
 import { lookupPincodeFromIndiaPost } from "@/lib/india-post-api";
-import { sendAvailabilityNotification, generateAvailabilityEmail } from "@/lib/email-service";
+import { sendAvailabilityNotification, generateAvailabilityEmail, isEmailBounced } from "@/lib/email-service";
 import { eq, and, lt, sql, or, inArray } from "drizzle-orm";
 import { cronLog, type CronLogEntry } from "@/lib/cron-log";
 import { acquireCronLock, releaseCronLock } from "@/lib/cron-lock";
@@ -11,7 +11,7 @@ import crypto from "crypto";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 2;
 const LOCK_LEASE_MS = 5 * 60 * 1000;
 const STALE_LOCK_TIMEOUT_MIN = 30;
 const BATCH_LIMIT = 25;
@@ -22,7 +22,7 @@ function generateDeliveryId(alertId: number): string {
   return `${alertId}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
 }
 
-async function deactivateAlert(
+async function deactivateAlertAtomic(
   alertId: number,
   email: string,
   productId: number,
@@ -32,25 +32,27 @@ async function deactivateAlert(
   lastError?: string,
   retryCount?: number,
 ) {
-  await db
-    .update(alerts)
-    .set({ active: false, notified: true, processing: false, processingUntil: null })
-    .where(eq(alerts.id, alertId));
+  await db.transaction(async (tx) => {
+    await tx
+      .update(alerts)
+      .set({ active: false, notified: true, processing: false, processingUntil: null })
+      .where(eq(alerts.id, alertId));
 
-  await db.insert(deadLetterQueue).values({
-    alertId,
-    email,
-    productId,
-    pincode: pincode || null,
-    reason: reason || "Permanently failed",
-    deliveryId: deliveryId || null,
-    lastError: lastError || null,
-    retryCount: retryCount ?? 0,
+    await tx.insert(deadLetterQueue).values({
+      alertId,
+      email,
+      productId,
+      pincode: pincode || null,
+      reason: reason || "Permanently failed",
+      deliveryId: deliveryId || null,
+      lastError: lastError || null,
+      retryCount: retryCount ?? 0,
+    });
   });
 }
 
 async function processAlerts() {
-  const log: CronLogEntry = { startedAt: new Date(), processed: 0, notified: 0, failed: 0, retried: 0 };
+  const log: CronLogEntry & { lifecycleEvents?: string } = { startedAt: new Date(), processed: 0, notified: 0, failed: 0, retried: 0 };
   const instanceId = `process_${Date.now()}`;
 
   // Step 1: Acquire distributed cron lock
@@ -61,7 +63,7 @@ async function processAlerts() {
   }
 
   try {
-    // Step 2: Unlock stale processing locks (alerts stuck in processing beyond lease)
+    // Step 2: Unlock stale processing locks
     const staleCutoff = new Date(Date.now() - STALE_LOCK_TIMEOUT_MIN * 60 * 1000);
     await db
       .update(alerts)
@@ -85,7 +87,6 @@ async function processAlerts() {
     const now = new Date();
     const leaseUntil = new Date(now.getTime() + LOCK_LEASE_MS);
 
-    // Subquery: pick up to BATCH_LIMIT candidate IDs
     const candidates = await db
       .select({ id: alerts.id })
       .from(alerts)
@@ -139,6 +140,14 @@ async function processAlerts() {
 
       for (const entry of retryLogs) {
         log.retried++;
+
+        await db.insert(analyticsEvents).values({
+          event: "alert_retrying",
+          email: entry.email,
+          productId: entry.productId,
+          metadata: JSON.stringify({ alertId: entry.alertId, deliveryId: entry.deliveryId, retryCount: entry.retryCount }),
+        }).catch(() => {});
+
         try {
           const result = await sendAvailabilityNotification({
             userName: "",
@@ -171,9 +180,8 @@ async function processAlerts() {
               .where(eq(alerts.id, entry.alertId));
           } else {
             log.failed++;
-            // Deactivate and move to dead letter queue if max retries exhausted
             if (entry.retryCount + 1 >= MAX_RETRIES) {
-              await deactivateAlert(
+              await deactivateAlertAtomic(
                 entry.alertId,
                 entry.email,
                 entry.productId,
@@ -191,6 +199,16 @@ async function processAlerts() {
       }
 
       return log;
+    }
+
+    // Log claimed lifecycle events
+    for (const c of claimed) {
+      await db.insert(analyticsEvents).values({
+        event: "alert_claimed",
+        email: null,
+        productId: null,
+        metadata: JSON.stringify({ alertId: c.id, instanceId }),
+      }).catch(() => {});
     }
 
     // Step 4: Fetch claimed alert details
@@ -211,7 +229,7 @@ async function processAlerts() {
       .where(eq(alerts.processing, true));
 
     const startTime = Date.now();
-    const analyticsBatch: Array<{ event: string; email: string; productId: number }> = [];
+    const analyticsBatch: Array<{ event: string; email: string; productId: number; metadata: string }> = [];
 
     for (const alert of activeAlerts) {
       // Time budget check — exit early if running out of time
@@ -229,25 +247,65 @@ async function processAlerts() {
       log.processed++;
       const deliveryId = generateDeliveryId(alert.alertId);
 
+      // SAFETY CHECK 1: Skip bounced emails
+      const bounced = await isEmailBounced(alert.email);
+      if (bounced) {
+        await deactivateAlertAtomic(
+          alert.alertId,
+          alert.email,
+          alert.productId,
+          alert.pincode,
+          deliveryId,
+          "Email bounced — permanently deactivated",
+          "Email is in bounced state",
+          0
+        );
+        await db.insert(analyticsEvents).values({
+          event: "email_bounced",
+          email: alert.email,
+          productId: alert.productId,
+          metadata: JSON.stringify({ alertId: alert.alertId, traceId: null }),
+        }).catch(() => {});
+        continue;
+      }
+
+      // SAFETY CHECK 2: targetPrice enforcement
+      // If targetPrice is set and productPrice is null, SKIP — cannot verify price
+      if (alert.targetPrice !== null && alert.productPrice === null) {
+        await db
+          .update(alerts)
+          .set({ processing: false, processingUntil: null })
+          .where(eq(alerts.id, alert.alertId));
+        continue;
+      }
+
+      // SAFETY CHECK 3: If both prices available, check threshold
+      if (alert.targetPrice !== null && alert.productPrice !== null) {
+        const currentPrice = parseFloat(alert.productPrice.replace(/[^0-9.]/g, ""));
+        if (!isNaN(currentPrice) && currentPrice > alert.targetPrice) {
+          await db
+            .update(alerts)
+            .set({ processing: false, processingUntil: null })
+            .where(eq(alerts.id, alert.alertId));
+          continue;
+        }
+      }
+
       try {
+        // Log scraped lifecycle event
+        analyticsBatch.push({
+          event: "alert_scraped",
+          email: alert.email,
+          productId: alert.productId,
+          metadata: JSON.stringify({ alertId: alert.alertId, deliveryId, pincode: alert.pincode }),
+        });
+
         const availabilityResult = await checkSinglePincodeAvailability(
           alert.productUrl,
           alert.pincode
         );
 
         if (availabilityResult.available) {
-          // targetPrice enforcement — skip if current price exceeds threshold
-          if (alert.targetPrice !== null && alert.productPrice !== null) {
-            const currentPrice = parseFloat(alert.productPrice.replace(/[^0-9.]/g, ""));
-            if (!isNaN(currentPrice) && currentPrice > alert.targetPrice) {
-              await db
-                .update(alerts)
-                .set({ processing: false, processingUntil: null })
-                .where(eq(alerts.id, alert.alertId));
-              continue;
-            }
-          }
-
           const pincodeDetails = await lookupPincodeFromIndiaPost(alert.pincode);
           const city = pincodeDetails?.district || "Unknown";
           const state = pincodeDetails?.state || "Unknown";
@@ -303,12 +361,19 @@ async function processAlerts() {
               event: "alert_notified",
               email: alert.email,
               productId: alert.productId,
+              metadata: JSON.stringify({ alertId: alert.alertId, deliveryId }),
             });
 
             log.notified++;
           } else {
             log.failed++;
-            await deactivateAlert(alert.alertId, alert.email, alert.productId, alert.pincode, deliveryId, "Initial notification delivery failed", emailResult.error, 0);
+            analyticsBatch.push({
+              event: "alert_failed",
+              email: alert.email,
+              productId: alert.productId,
+              metadata: JSON.stringify({ alertId: alert.alertId, deliveryId, error: emailResult.error }),
+            });
+            await deactivateAlertAtomic(alert.alertId, alert.email, alert.productId, alert.pincode, deliveryId, "Initial notification delivery failed", emailResult.error, 0);
           }
         } else {
           // Product not yet available — release lock so next cron cycle can re-check
@@ -321,6 +386,13 @@ async function processAlerts() {
         log.failed++;
         const errorMsg = error instanceof Error ? error.message : "Unknown error";
 
+        analyticsBatch.push({
+          event: "alert_failed",
+          email: alert.email,
+          productId: alert.productId,
+          metadata: JSON.stringify({ alertId: alert.alertId, error: errorMsg }),
+        });
+
         await db
           .update(alerts)
           .set({
@@ -331,7 +403,6 @@ async function processAlerts() {
           })
           .where(eq(alerts.id, alert.alertId));
 
-        // Move to dead letter queue if too many failures on this alert
         const [alertRecord] = await db
           .select({ retryCount: alerts.retryCount })
           .from(alerts)
@@ -339,7 +410,7 @@ async function processAlerts() {
           .limit(1);
 
         if (alertRecord && alertRecord.retryCount >= MAX_RETRIES) {
-          await deactivateAlert(alert.alertId, alert.email, alert.productId, alert.pincode, undefined, `Max retries (${MAX_RETRIES}) exceeded for processing`, errorMsg, alertRecord.retryCount);
+          await deactivateAlertAtomic(alert.alertId, alert.email, alert.productId, alert.pincode, undefined, `Max retries (${MAX_RETRIES}) exceeded for processing`, errorMsg, alertRecord.retryCount);
         }
       }
 

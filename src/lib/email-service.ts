@@ -1,11 +1,6 @@
-/**
- * Email Service for Product Availability Notifications
- * 
- * Supports multiple email providers:
- * - Resend (recommended): Set RESEND_API_KEY
- * - SMTP: Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
- * - Simulation: When no credentials are set (logs emails to console/DB)
- */
+import { db } from "@/db";
+import { userUsage } from "@/db/schema";
+import { eq } from "drizzle-orm";
 
 export interface EmailPayload {
   to: string;
@@ -19,6 +14,19 @@ export interface EmailResult {
   messageId?: string;
   error?: string;
   provider: "resend" | "smtp" | "simulation";
+}
+
+export async function isEmailBounced(email: string): Promise<boolean> {
+  try {
+    const [usage] = await db
+      .select({ bounced: userUsage.bounced })
+      .from(userUsage)
+      .where(eq(userUsage.email, email))
+      .limit(1);
+    return usage?.bounced ?? false;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -55,18 +63,18 @@ export function generateAvailabilityEmail(data: {
               </h1>
             </td>
           </tr>
-          
+
           <!-- Content -->
           <tr>
             <td style="padding: 40px 30px;">
               <p style="font-size: 18px; color: #1e293b; margin: 0 0 20px;">
                 Hello <strong>${data.userName}</strong>,
               </p>
-              
+
               <p style="font-size: 16px; color: #475569; margin: 0 0 30px; line-height: 1.6;">
                 Great news! The product you were tracking is now deliverable to your location.
               </p>
-              
+
               <!-- Product Card -->
               <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; margin-bottom: 30px;">
                 <tr>
@@ -77,7 +85,7 @@ export function generateAvailabilityEmail(data: {
                     <p style="font-size: 20px; color: #1e293b; margin: 0 0 20px; font-weight: 600;">
                       ${data.productName}
                     </p>
-                    
+
                     <table width="100%" cellpadding="0" cellspacing="0">
                       <tr>
                         <td width="50%">
@@ -97,7 +105,7 @@ export function generateAvailabilityEmail(data: {
                   </td>
                 </tr>
               </table>
-              
+
               <!-- CTA Button -->
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
@@ -108,13 +116,13 @@ export function generateAvailabilityEmail(data: {
                   </td>
                 </tr>
               </table>
-              
+
               <p style="font-size: 14px; color: #64748b; margin: 30px 0 0; line-height: 1.6;">
                 Don't wait too long — product availability can change quickly!
               </p>
             </td>
           </tr>
-          
+
           <!-- Footer -->
           <tr>
             <td style="background-color: #f8fafc; padding: 24px 30px; border-top: 1px solid #e2e8f0;">
@@ -156,9 +164,14 @@ Product Availability Tracker
  */
 async function sendWithResend(payload: EmailPayload): Promise<EmailResult> {
   const apiKey = process.env.RESEND_API_KEY;
-  
+
   if (!apiKey) {
     return { success: false, error: "RESEND_API_KEY not configured", provider: "resend" };
+  }
+
+  const emailFrom = process.env.EMAIL_FROM;
+  if (!emailFrom) {
+    return { success: false, error: "EMAIL_FROM not configured — must be set to a verified custom domain", provider: "resend" };
   }
 
   try {
@@ -169,7 +182,7 @@ async function sendWithResend(payload: EmailPayload): Promise<EmailResult> {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from: process.env.EMAIL_FROM || "Product Availability Tracker <notifications@resend.dev>",
+        from: emailFrom,
         to: payload.to,
         subject: payload.subject,
         html: payload.html,
@@ -194,38 +207,22 @@ async function sendWithResend(payload: EmailPayload): Promise<EmailResult> {
 }
 
 /**
- * Simulate email sending (logs to console)
- */
-function simulateEmail(payload: EmailPayload): EmailResult {
-  console.log("\n=== SIMULATED EMAIL ===");
-  console.log(`To: ${payload.to}`);
-  console.log(`Subject: ${payload.subject}`);
-  console.log("Body:", payload.text || "See HTML content");
-  console.log("======================\n");
-
-  return {
-    success: true,
-    messageId: `sim_${Date.now()}`,
-    provider: "simulation",
-  };
-}
-
-/**
  * Send email using configured provider
  */
 export async function sendEmail(payload: EmailPayload): Promise<EmailResult> {
-  // Check for Resend API key first
-  if (process.env.RESEND_API_KEY) {
-    return sendWithResend(payload);
+  if (!process.env.RESEND_API_KEY) {
+    return { success: false, error: "RESEND_API_KEY not configured — cannot send emails", provider: "resend" };
   }
 
-  // Fall back to simulation
-  console.warn("No email provider configured. Using simulation mode.");
-  return simulateEmail(payload);
+  if (!process.env.EMAIL_FROM) {
+    return { success: false, error: "EMAIL_FROM not configured — must be set to a verified custom domain before sending", provider: "resend" };
+  }
+
+  return sendWithResend(payload);
 }
 
 /**
- * Send availability notification email
+ * Send availability notification email with bounce check
  */
 export async function sendAvailabilityNotification(data: {
   userName: string;
@@ -236,6 +233,11 @@ export async function sendAvailabilityNotification(data: {
   city: string;
   state: string;
 }): Promise<EmailResult> {
+  const bounced = await isEmailBounced(data.email);
+  if (bounced) {
+    return { success: false, error: "Email is bounced — not sending notification", provider: "resend" };
+  }
+
   const { subject, html, text } = generateAvailabilityEmail(data);
 
   return sendEmail({

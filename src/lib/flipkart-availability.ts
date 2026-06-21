@@ -16,6 +16,23 @@ export interface FlipkartApiResult {
   isGloballyOutOfStock?: boolean;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function withRetry<T>(fn: () => Promise<T | null>, retries = 2): Promise<T | null> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const result = await fn();
+      if (result !== null && result !== undefined) return result;
+    } catch {
+      // Ignore and retry
+    }
+    if (i < retries) await delay([200, 500][i] || 500);
+  }
+  return null;
+}
+
 function flipkartHeaders(referer: string, extra?: Record<string, string>) {
   return {
     "User-Agent":
@@ -172,63 +189,60 @@ function parseRomeApiResponse(
   }
 }
 
-async function checkViaRomeApi(
+async function romeApiFetch(
   productUrl: string,
-  pincode: string
+  pincode: string,
+  useProxy: boolean
 ): Promise<FlipkartApiResult | null> {
-  try {
-    const urlObj = new URL(productUrl);
-    const pageUri = urlObj.pathname + urlObj.search;
+  const urlObj = new URL(productUrl);
+  const pageUri = urlObj.pathname + urlObj.search;
 
-    const romeUrl = "https://1.rome.api.flipkart.com/api/4/page/fetch";
+  const romeUrl = "https://1.rome.api.flipkart.com/api/4/page/fetch";
 
-    const payload = {
-      pageUri,
-      locationContext: { pincode },
-    };
+  const payload = {
+    pageUri,
+    locationContext: { pincode },
+  };
 
-    const response = await fetch(romeUrl, {
-      method: "POST",
-      headers: {
-        ...flipkartHeaders(productUrl),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(12_000),
-    });
+  const fetchFn = useProxy && process.env.SCRAPINGBEE_API_KEY ? fetchWithProxy : fetch;
+  const response = await fetchFn(romeUrl, {
+    method: "POST",
+    headers: {
+      ...flipkartHeaders(productUrl),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(12_000),
+  });
 
-    if (!response.ok) {
-      console.log(`Rome API responded with ${response.status}`);
-      return null;
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) {
-      console.log("Rome API returned non-JSON response");
-      return null;
-    }
-
-    const data = await response.json();
-    const parsed = parseRomeApiResponse(data, pincode);
-    if (!parsed) return null;
-
-    return {
-      success: true,
-      productName: null,
-      description: null,
-      imageUrl: null,
-      price: null,
-      pincode,
-      available: parsed.available,
-      deliveryInfo: parsed.deliveryInfo,
-      deliveryDate: parsed.deliveryDate,
-      error: null,
-      source: "rome_api",
-    };
-  } catch (err) {
-    console.log("Rome API check failed:", err);
+  if (!response.ok) {
+    console.log(`Rome API responded with ${response.status}`);
     return null;
   }
+
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    console.log("Rome API returned non-JSON response");
+    return null;
+  }
+
+  const data = await response.json();
+  const parsed = parseRomeApiResponse(data, pincode);
+  if (!parsed) return null;
+
+  return {
+    success: true,
+    productName: null,
+    description: null,
+    imageUrl: null,
+    price: null,
+    pincode,
+    available: parsed.available,
+    deliveryInfo: parsed.deliveryInfo,
+    deliveryDate: parsed.deliveryDate,
+    error: null,
+    source: "rome_api",
+  };
 }
 
 function extractJsonFromScriptTag(
@@ -326,69 +340,44 @@ function findPincodeAvailabilityInPageState(
   }
 }
 
-async function checkViaPageFetchWithPincode(
+async function pageFetchWithPincode(
   productUrl: string,
-  pincode: string
+  pincode: string,
+  useProxy: boolean
 ): Promise<FlipkartApiResult | null> {
-  try {
-    const fetchFn = process.env.SCRAPINGBEE_API_KEY ? fetchWithProxy : fetch;
-    const response = await fetchFn(productUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "X-Pincode": pincode,
-        "X-Location": pincode,
-        Cookie: `pincode=${pincode}; T=1; SN=1;`,
-        Referer: "https://www.flipkart.com/",
-        Connection: "keep-alive",
-      },
-      redirect: "follow",
-      signal: AbortSignal.timeout(15_000),
-    });
+  const fetchFn = useProxy && process.env.SCRAPINGBEE_API_KEY ? fetchWithProxy : fetch;
+  const response = await fetchFn(productUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-IN,en;q=0.9",
+      "X-Pincode": pincode,
+      "X-Location": pincode,
+      Cookie: `pincode=${pincode}; T=1; SN=1;`,
+      Referer: "https://www.flipkart.com/",
+      Connection: "keep-alive",
+    },
+    redirect: "follow",
+    signal: AbortSignal.timeout(15_000),
+  });
 
-    if (!response.ok) return null;
-    const html = await response.text();
-    const lowerHtml = html.toLowerCase();
+  if (!response.ok) return null;
+  const html = await response.text();
+  const lowerHtml = html.toLowerCase();
 
-    const productId = extractFlipkartProductId(productUrl);
-    const isProductPage =
-      lowerHtml.includes('"@type":"product"') ||
-      (productId && lowerHtml.includes(productId.toLowerCase())) ||
-      lowerHtml.includes("add to cart") ||
-      lowerHtml.includes("buy now") ||
-      lowerHtml.includes("currently out of stock");
+  const productId = extractFlipkartProductId(productUrl);
+  const isProductPage =
+    lowerHtml.includes('"@type":"product"') ||
+    (productId && lowerHtml.includes(productId.toLowerCase())) ||
+    lowerHtml.includes("add to cart") ||
+    lowerHtml.includes("buy now") ||
+    lowerHtml.includes("currently out of stock");
 
-    if (!isProductPage) {
-      const nextData = extractJsonFromScriptTag(html, "__NEXT_DATA__");
-      if (nextData) {
-        const stateResult = findPincodeAvailabilityInPageState(nextData, pincode);
-        if (stateResult) {
-          return {
-            success: true,
-            productName: null,
-            description: null,
-            imageUrl: null,
-            price: null,
-            pincode,
-            available: stateResult.available,
-            deliveryInfo: stateResult.deliveryInfo,
-            deliveryDate: stateResult.deliveryDate,
-            error: null,
-            source: "next_data",
-          };
-        }
-      }
-      return null;
-    }
-
+  if (!isProductPage) {
     const nextData = extractJsonFromScriptTag(html, "__NEXT_DATA__");
-    const initState = extractJsonFromScriptTag(html, "__INITIAL_STATE__");
-    const pageState = nextData || initState;
-
-    if (pageState) {
-      const stateResult = findPincodeAvailabilityInPageState(pageState, pincode);
+    if (nextData) {
+      const stateResult = findPincodeAvailabilityInPageState(nextData, pincode);
       if (stateResult) {
         return {
           success: true,
@@ -405,64 +394,45 @@ async function checkViaPageFetchWithPincode(
         };
       }
     }
+    return null;
+  }
 
-    const pincodeIndex = lowerHtml.indexOf(pincode);
-    if (pincodeIndex >= 0) {
-      const start = Math.max(0, pincodeIndex - 300);
-      const end = Math.min(lowerHtml.length, pincodeIndex + 300);
-      const pincodeContext = lowerHtml.slice(start, end);
+  const nextData = extractJsonFromScriptTag(html, "__NEXT_DATA__");
+  const initState = extractJsonFromScriptTag(html, "__INITIAL_STATE__");
+  const pageState = nextData || initState;
 
-      const hasNotServiceableNearby =
-        pincodeContext.includes("not serviceable") ||
-        pincodeContext.includes("not deliverable") ||
-        pincodeContext.includes("cannot be delivered") ||
-        pincodeContext.includes("delivery not available");
-
-      if (hasNotServiceableNearby) {
-        return {
-          success: true,
-          productName: null,
-          description: null,
-          imageUrl: null,
-          price: null,
-          pincode,
-          available: false,
-          deliveryInfo: `Not serviceable to pincode ${pincode}`,
-          deliveryDate: null,
-          error: null,
-          source: "page_fetch",
-        };
-      }
-
-      const hasDeliveryNearby =
-        pincodeContext.includes("delivery by") ||
-        pincodeContext.includes("delivered by") ||
-        pincodeContext.includes("arrives by") ||
-        pincodeContext.includes("estimated delivery");
-
-      if (hasDeliveryNearby) {
-        return {
-          success: true,
-          productName: null,
-          description: null,
-          imageUrl: null,
-          price: null,
-          pincode,
-          available: true,
-          deliveryInfo: `Delivery available to ${pincode}`,
-          deliveryDate: null,
-          error: null,
-          source: "page_fetch",
-        };
-      }
+  if (pageState) {
+    const stateResult = findPincodeAvailabilityInPageState(pageState, pincode);
+    if (stateResult) {
+      return {
+        success: true,
+        productName: null,
+        description: null,
+        imageUrl: null,
+        price: null,
+        pincode,
+        available: stateResult.available,
+        deliveryInfo: stateResult.deliveryInfo,
+        deliveryDate: stateResult.deliveryDate,
+        error: null,
+        source: "next_data",
+      };
     }
+  }
 
-    const isOutOfStock =
-      lowerHtml.includes("currently out of stock") ||
-      lowerHtml.includes("sold out") ||
-      lowerHtml.includes("currently unavailable");
+  const pincodeIndex = lowerHtml.indexOf(pincode);
+  if (pincodeIndex >= 0) {
+    const start = Math.max(0, pincodeIndex - 300);
+    const end = Math.min(lowerHtml.length, pincodeIndex + 300);
+    const pincodeContext = lowerHtml.slice(start, end);
 
-    if (isOutOfStock && pincodeIndex < 0) {
+    const hasNotServiceableNearby =
+      pincodeContext.includes("not serviceable") ||
+      pincodeContext.includes("not deliverable") ||
+      pincodeContext.includes("cannot be delivered") ||
+      pincodeContext.includes("delivery not available");
+
+    if (hasNotServiceableNearby) {
       return {
         success: true,
         productName: null,
@@ -471,49 +441,84 @@ async function checkViaPageFetchWithPincode(
         price: null,
         pincode,
         available: false,
-        deliveryInfo: "Product is currently out of stock",
+        deliveryInfo: `Not serviceable to pincode ${pincode}`,
         deliveryDate: null,
         error: null,
         source: "page_fetch",
       };
     }
 
-    return null;
-  } catch (err) {
-    console.log("Page-fetch check failed:", err);
-    return null;
+    const hasDeliveryNearby =
+      pincodeContext.includes("delivery by") ||
+      pincodeContext.includes("delivered by") ||
+      pincodeContext.includes("arrives by") ||
+      pincodeContext.includes("estimated delivery");
+
+    if (hasDeliveryNearby) {
+      return {
+        success: true,
+        productName: null,
+        description: null,
+        imageUrl: null,
+        price: null,
+        pincode,
+        available: true,
+        deliveryInfo: `Delivery available to ${pincode}`,
+        deliveryDate: null,
+        error: null,
+        source: "page_fetch",
+      };
+    }
   }
+
+  const isOutOfStock =
+    lowerHtml.includes("currently out of stock") ||
+    lowerHtml.includes("sold out") ||
+    lowerHtml.includes("currently unavailable");
+
+  if (isOutOfStock && pincodeIndex < 0) {
+    return {
+      success: true,
+      productName: null,
+      description: null,
+      imageUrl: null,
+      price: null,
+      pincode,
+      available: false,
+      deliveryInfo: "Product is currently out of stock",
+      deliveryDate: null,
+      error: null,
+      source: "page_fetch",
+    };
+  }
+
+  return null;
 }
 
 async function checkViaPuppeteer(
   productUrl: string,
   pincode: string
 ): Promise<FlipkartApiResult | null> {
-  try {
-    const { checkFlipkartAvailabilityReal } = await import(
-      "./flipkart-real-checker"
-    );
-    const result = await checkFlipkartAvailabilityReal(productUrl, pincode);
+  const { checkFlipkartAvailabilityReal } = await import(
+    "./flipkart-real-checker"
+  );
+  const result = await checkFlipkartAvailabilityReal(productUrl, pincode);
 
-    if (!result.success) return null;
+  if (!result.success) return null;
 
-    return {
-      success: true,
-      productName: result.productName,
-      description: null,
-      imageUrl: null,
-      price: result.price,
-      pincode,
-      available: result.available,
-      deliveryInfo: result.deliveryInfo,
-      deliveryDate: null,
-      error: null,
-      source: "puppeteer",
-    };
-  } catch (err) {
-    console.log("Puppeteer check failed:", err);
-    return null;
-  }
+  return {
+    success: true,
+    productName: result.productName,
+    description: null,
+    imageUrl: null,
+    price: result.price,
+    pincode,
+    available: result.available,
+    deliveryInfo: result.deliveryInfo,
+    deliveryDate: null,
+    error: null,
+    source: "puppeteer",
+  };
 }
 
 export async function checkFlipkartPincodeServiceability(
@@ -534,22 +539,46 @@ export async function checkFlipkartPincodeServiceability(
     source: "fallback",
   };
 
-  const romeResult = await checkViaRomeApi(productUrl, pincode);
+  // --- Strategy 1: Rome API ---
+  // Try via ScrapingBee proxy first, then direct
+  let romeResult: FlipkartApiResult | null = null;
+  if (process.env.SCRAPINGBEE_API_KEY) {
+    romeResult = await withRetry(() => romeApiFetch(productUrl, pincode, true));
+  }
+  if (!romeResult) {
+    romeResult = await withRetry(() => romeApiFetch(productUrl, pincode, false));
+  }
   if (romeResult) {
     console.log(`[Flipkart] Rome API check for ${pincode}: ${romeResult.available ? "✅ Available" : "❌ Not available"}`);
     return romeResult;
   }
 
-  const pageFetchResult = await checkViaPageFetchWithPincode(productUrl, pincode);
+  await delay(500);
+
+  // --- Strategy 2: Page Fetch ---
+  let pageFetchResult: FlipkartApiResult | null = null;
+  if (process.env.SCRAPINGBEE_API_KEY) {
+    pageFetchResult = await withRetry(() => pageFetchWithPincode(productUrl, pincode, true));
+  }
+  if (!pageFetchResult) {
+    pageFetchResult = await withRetry(() => pageFetchWithPincode(productUrl, pincode, false));
+  }
   if (pageFetchResult) {
     console.log(`[Flipkart] Page-fetch check for ${pincode}: ${pageFetchResult.available ? "✅ Available" : "❌ Not available"}`);
     return pageFetchResult;
   }
 
-  const puppeteerResult = await checkViaPuppeteer(productUrl, pincode);
-  if (puppeteerResult) {
-    console.log(`[Flipkart] Puppeteer check for ${pincode}: ${puppeteerResult.available ? "✅ Available" : "❌ Not available"}`);
-    return puppeteerResult;
+  await delay(500);
+
+  // --- Strategy 3: Puppeteer ---
+  try {
+    const puppeteerResult = await withRetry(() => checkViaPuppeteer(productUrl, pincode), 1);
+    if (puppeteerResult) {
+      console.log(`[Flipkart] Puppeteer check for ${pincode}: ${puppeteerResult.available ? "✅ Available" : "❌ Not available"}`);
+      return puppeteerResult;
+    }
+  } catch {
+    console.log("Puppeteer import failed, skipping");
   }
 
   console.log(`[Flipkart] All strategies failed for pincode ${pincode} — unverified`);

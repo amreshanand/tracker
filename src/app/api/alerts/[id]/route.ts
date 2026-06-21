@@ -1,5 +1,5 @@
 import { db } from "@/db";
-import { alerts, userUsage } from "@/db/schema";
+import { alerts, userUsage, analyticsEvents } from "@/db/schema";
 import { eq, sql } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
@@ -17,7 +17,7 @@ export async function DELETE(
     }
 
     const [alert] = await db
-      .select({ email: alerts.email })
+      .select({ email: alerts.email, productId: alerts.productId, traceId: alerts.traceId })
       .from(alerts)
       .where(eq(alerts.id, alertId))
       .limit(1);
@@ -35,6 +35,13 @@ export async function DELETE(
         updatedAt: new Date(),
       })
       .where(eq(userUsage.email, alert.email));
+
+    await db.insert(analyticsEvents).values({
+      event: "alert_deactivated",
+      email: alert.email,
+      productId: alert.productId,
+      metadata: JSON.stringify({ traceId: alert.traceId }),
+    });
 
     return Response.json({ message: "Alert deactivated successfully" });
   } catch (error) {

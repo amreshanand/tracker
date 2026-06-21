@@ -1,5 +1,5 @@
 import { db } from "@/db";
-import { alerts } from "@/db/schema";
+import { alerts, analyticsEvents } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
@@ -37,6 +37,13 @@ export async function GET(request: Request) {
         verificationToken: null,
       })
       .where(eq(alerts.id, alert.id));
+
+    await db.insert(analyticsEvents).values({
+      event: "alert_activated",
+      email: alert.email,
+      productId: alert.productId,
+      metadata: JSON.stringify({ traceId: alert.traceId }),
+    });
 
     return new Response(
       `<html>

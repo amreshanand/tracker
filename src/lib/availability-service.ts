@@ -23,6 +23,8 @@ import { isCircuitAvailable, recordSuccess, recordFailure } from "./circuit-brea
 
 const STRATEGY_TIMEOUT = 8000; // 8s per strategy before fallback
 
+export type ScrapeStatus = "ok" | "rate_limited" | "proxy_failed" | "cached" | "unverified";
+
 export interface AvailabilityCheckResult {
   pincode: string;
   pincodeDetails: PincodeDetails | null;
@@ -35,6 +37,8 @@ export interface AvailabilityCheckResult {
   source: "real" | "unverified";
   /** confirmed = explicit signal; unknown = could not determine */
   confidence: "confirmed" | "unknown";
+  /** Explicit status tracking for the scraping attempt */
+  scrapeStatus: ScrapeStatus;
 }
 
 export interface BulkAvailabilityResult {
@@ -222,6 +226,7 @@ export async function checkSinglePincodeAvailability(
         checkedAt: new Date(),
         source: "unverified",
         confidence: "unknown",
+        scrapeStatus: "proxy_failed",
       };
     }
   }
@@ -264,6 +269,7 @@ export async function checkSinglePincodeAvailability(
               checkedAt: new Date(cached.lastChecked),
               source: "real",
               confidence: "confirmed",
+              scrapeStatus: "cached",
             };
           }
         }
@@ -288,6 +294,7 @@ export async function checkSinglePincodeAvailability(
           checkedAt: new Date(),
           source: "real",
           confidence: "confirmed",
+          scrapeStatus: "ok",
         };
       }
 
@@ -305,6 +312,7 @@ export async function checkSinglePincodeAvailability(
             checkedAt: new Date(),
             source: "real",
             confidence: "confirmed" as const,
+            scrapeStatus: "ok",
           };
           persistAvailabilityCheck(productUrl, pincode, result);
           return result;
@@ -331,6 +339,7 @@ export async function checkSinglePincodeAvailability(
           checkedAt: new Date(),
           source: "real",
           confidence: "confirmed",
+          scrapeStatus: "ok",
         };
         persistAvailabilityCheck(productUrl, pincode, checkResult);
         return checkResult;
@@ -349,6 +358,7 @@ export async function checkSinglePincodeAvailability(
           checkedAt: new Date(),
           source: "unverified",
           confidence: "unknown",
+          scrapeStatus: "unverified",
         };
       }
     } catch (err) {
@@ -366,6 +376,7 @@ export async function checkSinglePincodeAvailability(
         checkedAt: new Date(),
         source: "unverified",
         confidence: "unknown",
+        scrapeStatus: "unverified",
       };
     }
   }
@@ -383,6 +394,7 @@ export async function checkSinglePincodeAvailability(
         checkedAt: new Date(),
         source: "real",
         confidence: "confirmed" as const,
+        scrapeStatus: "ok",
       };
       persistAvailabilityCheck(productUrl, pincode, amazonCheckResult);
       return amazonCheckResult;
@@ -398,6 +410,7 @@ export async function checkSinglePincodeAvailability(
         checkedAt: new Date(),
         source: "unverified",
         confidence: "unknown",
+        scrapeStatus: "unverified",
       };
     }
   }
@@ -412,6 +425,7 @@ export async function checkSinglePincodeAvailability(
     checkedAt: new Date(),
     source: "unverified",
     confidence: "unknown",
+    scrapeStatus: "unverified",
   };
 }
 

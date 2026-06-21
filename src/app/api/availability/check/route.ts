@@ -17,7 +17,7 @@ export const dynamic = "force-dynamic";
 export async function POST(request: Request) {
   try {
     const ip = getClientIp(request);
-    const { allowed, retryAfter } = apiLimiter.check(`check:${ip}`);
+    const { allowed, retryAfter } = await apiLimiter.check(`check:${ip}`);
     if (!allowed) {
       return Response.json(
         { error: `Too many requests. Try again in ${retryAfter}s.` },

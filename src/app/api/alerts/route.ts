@@ -5,11 +5,15 @@ import { eq, desc, and, sql } from "drizzle-orm";
 import { emailAlertLimiter, getClientIp } from "@/lib/rate-limit";
 import { checkIdempotency, saveIdempotencyResponse } from "@/lib/idempotency";
 import { sendEmail } from "@/lib/email-service";
+import { isDisposableEmail } from "@/lib/disposable-emails";
 import crypto from "crypto";
 
 export const dynamic = "force-dynamic";
 
 const FREE_TIER_MAX_ALERTS = 5;
+const MAX_REQUEST_BODY_BYTES = 4096;
+const MAX_USERNAME_LENGTH = 100;
+const MAX_METADATA_LENGTH = 2000;
 
 function getBaseUrl(request: Request): string {
   const url = new URL(request.url);
@@ -38,6 +42,12 @@ async function sendVerificationEmail(email: string, token: string, baseUrl: stri
 
 export async function POST(request: Request) {
   try {
+    // Request size limit
+    const contentLength = request.headers.get("content-length");
+    if (contentLength && parseInt(contentLength) > MAX_REQUEST_BODY_BYTES) {
+      return Response.json({ error: "Request body too large" }, { status: 413 });
+    }
+
     const body = await request.json();
     const { userName, email, pincode, productUrl, productName, targetPrice, idempotencyKey } = body;
 
@@ -59,8 +69,20 @@ export async function POST(request: Request) {
       );
     }
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (typeof userName !== "string" || userName.length > MAX_USERNAME_LENGTH || userName.length < 1) {
+      return Response.json({ error: "Name must be 1-100 characters" }, { status: 400 });
+    }
+
+    if (typeof email !== "string" || email.length > 254) {
       return Response.json({ error: "Invalid email address" }, { status: 400 });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return Response.json({ error: "Invalid email address format" }, { status: 400 });
+    }
+
+    if (isDisposableEmail(email)) {
+      return Response.json({ error: "Disposable email addresses are not allowed" }, { status: 400 });
     }
 
     if (!/^\d{6}$/.test(pincode)) {
@@ -70,9 +92,21 @@ export async function POST(request: Request) {
       );
     }
 
+    if (productUrl.length > 2000) {
+      return Response.json({ error: "Product URL too long" }, { status: 400 });
+    }
+
+    if (productName && (typeof productName !== "string" || productName.length > 500)) {
+      return Response.json({ error: "Product name too long" }, { status: 400 });
+    }
+
+    if (targetPrice && (isNaN(parseFloat(targetPrice)) || parseFloat(targetPrice) <= 0)) {
+      return Response.json({ error: "Invalid target price" }, { status: 400 });
+    }
+
     // Per-email rate limiting
     const ip = getClientIp(request);
-    const emailLimit = emailAlertLimiter.check(`alert:${email}:${ip}`);
+    const emailLimit = await emailAlertLimiter.check(`alert:${email}:${ip}`);
     if (!emailLimit.allowed) {
       return Response.json(
         { error: `Too many alert creations. Try again in ${emailLimit.retryAfter}s.` },
@@ -157,6 +191,7 @@ export async function POST(request: Request) {
 
     // Create alert (pending email verification)
     const verificationToken = generateVerificationToken();
+    const traceId = crypto.randomUUID();
     const [newAlert] = await db
       .insert(alerts)
       .values({
@@ -168,6 +203,7 @@ export async function POST(request: Request) {
         emailVerified: false,
         active: false,
         verificationToken,
+        traceId,
       })
       .returning();
 
@@ -192,12 +228,12 @@ export async function POST(request: Request) {
     const baseUrl = getBaseUrl(request);
     sendVerificationEmail(email, verificationToken, baseUrl, product.name);
 
-    // Track analytics event
+    // Track analytics + lifecycle event
     await db.insert(analyticsEvents).values({
       event: "alert_created",
       email,
       productId: product.id,
-      metadata: JSON.stringify({ platform: product.platform, pincode, hasTargetPrice: !!targetPrice }),
+      metadata: JSON.stringify({ platform: product.platform, pincode, hasTargetPrice: !!targetPrice, traceId }),
     });
 
     const resp = {

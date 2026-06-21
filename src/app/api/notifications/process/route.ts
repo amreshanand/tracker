@@ -3,7 +3,7 @@ import { alerts, products, notificationLog, analyticsEvents, userUsage, deadLett
 import { checkSinglePincodeAvailability } from "@/lib/availability-service";
 import { lookupPincodeFromIndiaPost } from "@/lib/india-post-api";
 import { sendAvailabilityNotification, generateAvailabilityEmail } from "@/lib/email-service";
-import { eq, and, lt, sql, or } from "drizzle-orm";
+import { eq, and, lt, sql, or, inArray } from "drizzle-orm";
 import { cronLog, type CronLogEntry } from "@/lib/cron-log";
 import { acquireCronLock, releaseCronLock } from "@/lib/cron-lock";
 import crypto from "crypto";
@@ -16,6 +16,7 @@ const LOCK_LEASE_MS = 5 * 60 * 1000;
 const STALE_LOCK_TIMEOUT_MIN = 30;
 const BATCH_LIMIT = 25;
 const TIME_BUDGET_MS = 45_000;
+const UNVERIFIED_EXPIRY_DAYS = 7;
 
 function generateDeliveryId(alertId: number): string {
   return `${alertId}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
@@ -67,12 +68,27 @@ async function processAlerts() {
       .set({ processing: false, processingUntil: null })
       .where(and(eq(alerts.processing, true), lt(alerts.processingUntil || sql`now()`, staleCutoff)));
 
+    // Step 2b: Expire unverified alerts older than UNVERIFIED_EXPIRY_DAYS
+    const expiryCutoff = new Date(Date.now() - UNVERIFIED_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+    await db
+      .update(alerts)
+      .set({ active: false, notified: true })
+      .where(
+        and(
+          eq(alerts.emailVerified, false),
+          eq(alerts.active, false),
+          lt(alerts.createdAt || sql`now()`, expiryCutoff)
+        )
+      );
+
     // Step 3: Atomically claim alerts with lease-based lock (bounded batch)
     const now = new Date();
     const leaseUntil = new Date(now.getTime() + LOCK_LEASE_MS);
-    const claimed = await db
-      .update(alerts)
-      .set({ processing: true, processingUntil: leaseUntil })
+
+    // Subquery: pick up to BATCH_LIMIT candidate IDs
+    const candidates = await db
+      .select({ id: alerts.id })
+      .from(alerts)
       .where(
         and(
           eq(alerts.active, true),
@@ -81,8 +97,23 @@ async function processAlerts() {
           or(eq(alerts.processing, false), lt(alerts.processingUntil || sql`now()`, now))
         )
       )
-      .returning({ id: alerts.id })
       .limit(BATCH_LIMIT);
+
+    const claimed = candidates.length > 0
+      ? await db
+          .update(alerts)
+          .set({ processing: true, processingUntil: leaseUntil })
+          .where(
+            and(
+              eq(alerts.active, true),
+              eq(alerts.notified, false),
+              or(eq(alerts.emailVerified, true), sql`${alerts.emailVerified} is null`),
+              or(eq(alerts.processing, false), lt(alerts.processingUntil || sql`now()`, now)),
+              inArray(alerts.id, candidates.map(c => c.id))
+            )
+          )
+          .returning({ id: alerts.id })
+      : [];
 
     if (claimed.length === 0) {
       // Step 3b: Retry failed notifications (state machine support)
@@ -180,10 +211,14 @@ async function processAlerts() {
       .where(eq(alerts.processing, true));
 
     const startTime = Date.now();
+    const analyticsBatch: Array<{ event: string; email: string; productId: number }> = [];
 
     for (const alert of activeAlerts) {
       // Time budget check — exit early if running out of time
       if (Date.now() - startTime > TIME_BUDGET_MS) {
+        if (analyticsBatch.length > 0) {
+          await db.insert(analyticsEvents).values(analyticsBatch).catch(() => {});
+        }
         await db
           .update(alerts)
           .set({ processing: false, processingUntil: null })
@@ -264,8 +299,8 @@ async function processAlerts() {
               })
               .where(eq(userUsage.email, alert.email));
 
-            await db.insert(analyticsEvents).values({
-              event: "alert_triggered",
+            analyticsBatch.push({
+              event: "alert_notified",
               email: alert.email,
               productId: alert.productId,
             });
@@ -313,6 +348,11 @@ async function processAlerts() {
         .update(alerts)
         .set({ processingUntil: new Date(Date.now() + LOCK_LEASE_MS) })
         .where(eq(alerts.processing, true));
+    }
+
+    // Flush batched analytics
+    if (analyticsBatch.length > 0) {
+      await db.insert(analyticsEvents).values(analyticsBatch).catch(() => {});
     }
 
     return log;

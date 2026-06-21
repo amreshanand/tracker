@@ -4,7 +4,22 @@ import { count, eq, and, sql, desc, lt } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+function requireAdmin(request: Request): Response | null {
+  const authHeader = request.headers.get("authorization");
+  const apiKey = process.env.ADMIN_API_KEY;
+  if (!apiKey) {
+    return null;
+  }
+  if (!authHeader || !authHeader.startsWith("Bearer ") || authHeader.slice(7) !== apiKey) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  return null;
+}
+
+export async function GET(request: Request) {
+  const authError = requireAdmin(request);
+  if (authError) return authError;
+
   try {
     // Core counts
     const [productCount] = await db.select({ count: count() }).from(products);

@@ -4,7 +4,14 @@ import { sql, eq, and, count, lt } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: Request) {
+  const authHeader = request.headers.get("authorization");
+  const apiKey = process.env.ADMIN_API_KEY;
+  if (apiKey) {
+    if (!authHeader || !authHeader.startsWith("Bearer ") || authHeader.slice(7) !== apiKey) {
+      return Response.json({ error: "Unauthorized" }, { status: 401 });
+    }
+  }
   try {
     const start = Date.now();
     const result = await db.execute(sql`SELECT 1 as test`);

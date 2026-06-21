@@ -201,7 +201,7 @@ export async function POST(request: Request) {
     const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
       || request.headers.get("x-real-ip")
       || "unknown";
-    const { allowed, retryAfter } = apiLimiter.check(`scrape:${ip}`);
+    const { allowed, retryAfter } = await apiLimiter.check(`scrape:${ip}`);
     if (!allowed) {
       return Response.json(
         { error: `Too many requests. Try again in ${retryAfter}s.` },

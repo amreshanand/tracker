@@ -1,6 +1,7 @@
 const API_BASE_URL = 'https://price-tracker-india.vercel.app';
 const CONCURRENCY = 5;
 const CACHE_TTL_MS = 30 * 60 * 1000;
+const MAX_RETRIES_PER_PINCODE = 1;
 
 const PINCODES = [
   { pincode: '110001', city: 'Delhi' },
@@ -55,6 +56,16 @@ async function checkPincode(product, pincode, city) {
       }),
     });
     const data = await safeJson(response);
+
+    if (!response.ok) {
+      const errorMsg = (data && data.error) || `Server error (${response.status})`;
+      return { pincode, city, available: null, confidence: 'unverified', error: errorMsg };
+    }
+
+    if (data && data.circuitBreakerOpen) {
+      return { pincode, city, available: null, confidence: 'unverified', error: data.error || 'Availability checks temporarily disabled' };
+    }
+
     if (data && data.result) {
       return {
         pincode,
@@ -62,11 +73,14 @@ async function checkPincode(product, pincode, city) {
         available: data.result.available,
         confidence: data.result.confidence || 'verified',
         deliveryInfo: data.result.deliveryInfo || null,
+        error: null,
       };
     }
-    return { pincode, city, available: null, confidence: 'unverified' };
-  } catch {
-    return { pincode, city, available: null, confidence: 'unverified' };
+
+    return { pincode, city, available: null, confidence: 'unverified', error: 'Unexpected response format' };
+  } catch (err) {
+    const errorMsg = (err && err.name === 'AbortError') ? 'Request timed out' : 'Network error';
+    return { pincode, city, available: null, confidence: 'unverified', error: errorMsg };
   }
 }
 
@@ -126,7 +140,6 @@ function saveToCache(productUrl, data) {
   chrome.storage.local.get(['availCache'], (result) => {
     const cache = result.availCache || {};
     cache[productUrl] = { ts: Date.now(), data };
-    // Prune old entries
     for (const key of Object.keys(cache)) {
       if (Date.now() - cache[key].ts > CACHE_TTL_MS * 2) delete cache[key];
     }
@@ -138,17 +151,47 @@ function renderResults() {
   const container = document.getElementById('region-list');
   let html = '';
   let done = 0;
+  let errors = 0;
+  let sampleError = '';
   for (const r of results.values()) {
-    const statusClass = !r.available && r.available !== false ? 'pending' : r.available ? 'available' : 'unavailable';
-    const badgeClass = !r.available && r.available !== false ? 'checking' : r.available ? 'yes' : 'no';
-    const badgeText = !r.available && r.available !== false ? 'Checking...' : r.available ? '✓ In Stock' : 'Not Available';
-    if (r.available !== null) done++;
+    const hasError = !!r.error;
+    const isPending = r.available === null && !hasError;
+
+    let statusClass, badgeClass, badgeText, icon;
+    if (hasError) {
+      statusClass = 'unavailable';
+      badgeClass = 'no';
+      badgeText = '⚠ Error';
+      icon = '⚠️';
+    } else if (isPending) {
+      statusClass = 'pending';
+      badgeClass = 'checking';
+      badgeText = 'Checking...';
+      icon = '⏳';
+    } else if (r.available) {
+      statusClass = 'available';
+      badgeClass = 'yes';
+      badgeText = '✓ In Stock';
+      icon = '✅';
+    } else {
+      statusClass = 'unavailable';
+      badgeClass = 'no';
+      badgeText = 'Not Available';
+      icon = '❌';
+    }
+    if (!isPending) done++;
+    if (hasError) {
+      errors++;
+      if (!sampleError) sampleError = r.error;
+    }
+
     html += `
       <div class="region-row ${statusClass}">
-        <div class="region-icon">${r.available === true ? '✅' : r.available === false ? '❌' : '⏳'}</div>
+        <div class="region-icon">${icon}</div>
         <div class="region-info">
           <div class="region-city">${escapeHtml(r.city)}</div>
           <div class="region-code">${r.pincode}</div>
+          ${hasError ? `<div style="font-size:10px;color:#dc2626;margin-top:2px;">${escapeHtml(r.error)}</div>` : ''}
         </div>
         <span class="region-status ${badgeClass}">${badgeText}</span>
       </div>
@@ -156,32 +199,44 @@ function renderResults() {
   }
   container.innerHTML = html;
 
-  // Update status
   const statusBar = document.getElementById('status-bar');
   const statusText = document.getElementById('status-text');
   const statusCount = document.getElementById('status-count');
+  const spinner = document.getElementById('status-spinner');
+
   statusBar.className = 'status-bar';
   if (done === 0) {
     statusBar.classList.add('loading');
     statusText.textContent = '🔍 Checking availability across India...';
     statusCount.textContent = '';
-    document.getElementById('status-spinner').style.display = '';
+    spinner.style.display = '';
   } else if (done < PINCODES.length) {
     statusBar.classList.add('loading');
-    statusText.textContent = `Checked ${done}/${PINCODES.length} regions`;
+    statusText.textContent = `Checked ${done}/${PINCODES.length} regions${errors ? ` (${errors} failed)` : ''}`;
     statusCount.textContent = '';
-    document.getElementById('status-spinner').style.display = '';
+    spinner.style.display = errors > 0 && done >= PINCODES.length - errors ? 'none' : '';
   } else {
     const available = [...results.values()].filter(r => r.available === true).length;
-    statusBar.classList.add('done');
-    statusText.textContent = `✅ Available in ${available}/${PINCODES.length} regions`;
-    statusCount.textContent = '';
-    document.getElementById('status-spinner').style.display = 'none';
+    if (errors === PINCODES.length) {
+      statusBar.classList.add('error');
+      statusText.textContent = `⚠ Server unreachable (${sampleError || 'all requests failed'})`;
+      statusCount.textContent = 'Retrying...';
+      spinner.style.display = 'none';
+    } else if (errors > 0) {
+      statusBar.classList.add('error');
+      statusText.textContent = `✅ ${available} in stock — ${errors} regions could not be checked`;
+      statusCount.textContent = '';
+      spinner.style.display = 'none';
+    } else {
+      statusBar.classList.add('done');
+      statusText.textContent = `✅ Available in ${available}/${PINCODES.length} regions`;
+      statusCount.textContent = '';
+      spinner.style.display = 'none';
+    }
   }
 
-  // Show alert section when done
   const alertSection = document.getElementById('alert-section');
-  if (done === PINCODES.length) {
+  if (done === PINCODES.length && errors === 0) {
     alertSection.classList.remove('hidden');
     document.getElementById('footer-note').textContent = 'Data may vary by exact address. Verify with the retailer before purchasing.';
   } else {
@@ -195,13 +250,13 @@ async function checkAllPincodes(product) {
   el.classList.add('loading');
   document.getElementById('status-spinner').style.display = '';
 
-  // Initialize all as pending
   for (const p of PINCODES) {
-    results.set(p.pincode, { pincode: p.pincode, city: p.city, available: null, confidence: 'pending' });
+    results.set(p.pincode, { pincode: p.pincode, city: p.city, available: null, confidence: 'pending', error: null });
   }
   renderResults();
 
-  let completed = 0;
+  let failedPincodes = [];
+
   for (let i = 0; i < PINCODES.length; i += CONCURRENCY) {
     const batch = PINCODES.slice(i, i + CONCURRENCY);
     const promises = batch.map(p => checkPincode(product, p.pincode, p.city));
@@ -210,13 +265,25 @@ async function checkAllPincodes(product) {
       if (settled.status === 'fulfilled' && settled.value) {
         const r = settled.value;
         results.set(r.pincode, r);
+        if (r.error) failedPincodes.push(r.pincode);
       }
-      completed++;
     }
     renderResults();
   }
 
-  // Cache
+  // Retry failed pincodes once
+  if (failedPincodes.length > 0) {
+    await new Promise(r => setTimeout(r, 1000));
+    for (const pincode of failedPincodes) {
+      const city = PINCODES.find(p => p.pincode === pincode)?.city || pincode;
+      const retryResult = await checkPincode(product, pincode, city);
+      if (!retryResult.error) {
+        results.set(pincode, retryResult);
+      }
+    }
+    renderResults();
+  }
+
   const cacheData = {};
   for (const [pincode, r] of results) {
     cacheData[pincode] = r;
@@ -277,58 +344,59 @@ async function submitNotification() {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
-  currentProduct = await getCurrentProduct();
-  displayProduct(currentProduct);
+  try {
+    currentProduct = await getCurrentProduct();
+    displayProduct(currentProduct);
 
-  document.getElementById('alert-btn').addEventListener('click', submitNotification);
+    document.getElementById('alert-btn').addEventListener('click', submitNotification);
 
-  // Auto-restore saved name/email
-  chrome.storage.local.get(['savedName', 'savedEmail'], (result) => {
-    if (result.savedName) document.getElementById('alert-name').value = result.savedName;
-    if (result.savedEmail) document.getElementById('alert-email').value = result.savedEmail;
-  });
-
-  document.getElementById('alert-name').addEventListener('blur', () => {
-    chrome.storage.local.set({ savedName: document.getElementById('alert-name').value });
-  });
-  document.getElementById('alert-email').addEventListener('blur', () => {
-    chrome.storage.local.set({ savedEmail: document.getElementById('alert-email').value });
-  });
-
-  // Track install once
-  chrome.storage.local.get(['installTracked'], (result) => {
-    if (!result.installTracked) {
+    chrome.storage.local.get(['savedName', 'savedEmail'], (result) => {
       try {
-        fetchWithTimeout(`${API_BASE_URL}/api/analytics/track`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ event: 'install' }),
-        }, 3000);
+        if (result.savedName) document.getElementById('alert-name').value = result.savedName;
+        if (result.savedEmail) document.getElementById('alert-email').value = result.savedEmail;
       } catch {}
-      chrome.storage.local.set({ installTracked: true });
-    }
-  });
+    });
 
-  if (!currentProduct) return;
+    document.getElementById('alert-name').addEventListener('blur', () => {
+      chrome.storage.local.set({ savedName: document.getElementById('alert-name').value });
+    });
+    document.getElementById('alert-email').addEventListener('blur', () => {
+      chrome.storage.local.set({ savedEmail: document.getElementById('alert-email').value });
+    });
 
-  // Check cache first
-  const cached = await getFromCache(currentProduct.url);
-  if (cached) {
-    for (const p of PINCODES) {
-      if (cached[p.pincode]) results.set(p.pincode, cached[p.pincode]);
+    if (!currentProduct) return;
+
+    const cached = await getFromCache(currentProduct.url);
+    if (cached) {
+      for (const p of PINCODES) {
+        if (cached[p.pincode]) results.set(p.pincode, cached[p.pincode]);
+      }
+      const done = [...results.values()].filter(r => r.available !== null || r.error).length;
+      if (done === PINCODES.length) {
+        document.getElementById('status-bar').classList.remove('hidden');
+        const available = [...results.values()].filter(r => r.available === true).length;
+        const errors = [...results.values()].filter(r => r.error).length;
+        if (errors > 0) {
+          document.getElementById('status-bar').classList.add('error');
+          document.getElementById('status-text').textContent = `✅ ${available} in stock — ${errors} regions could not be checked`;
+        } else {
+          document.getElementById('status-bar').classList.add('done');
+          document.getElementById('status-text').textContent = `✅ Available in ${available}/${PINCODES.length} regions`;
+        }
+        document.getElementById('status-spinner').style.display = 'none';
+        document.getElementById('alert-section').classList.remove('hidden');
+        document.getElementById('footer-note').textContent = 'Data may vary by exact address. Verify with the retailer before purchasing.';
+        renderResults();
+        return;
+      }
     }
-    const done = [...results.values()].filter(r => r.available !== null).length;
-    if (done === PINCODES.length) {
-      document.getElementById('status-bar').classList.remove('hidden');
-      document.getElementById('status-bar').classList.add('done');
-      document.getElementById('status-text').textContent = `✅ Available in ${[...results.values()].filter(r => r.available === true).length}/${PINCODES.length} regions`;
-      document.getElementById('status-spinner').style.display = 'none';
-      document.getElementById('alert-section').classList.remove('hidden');
-      document.getElementById('footer-note').textContent = 'Data may vary by exact address. Verify with the retailer before purchasing.';
-      renderResults();
-      return;
-    }
+
+    checkAllPincodes(currentProduct);
+  } catch (err) {
+    const statusBar = document.getElementById('status-bar');
+    statusBar.classList.remove('hidden');
+    statusBar.classList.add('error');
+    document.getElementById('status-text').textContent = '⚠ Failed to start. Try reopening the popup.';
+    document.getElementById('status-spinner').style.display = 'none';
   }
-
-  checkAllPincodes(currentProduct);
 });

@@ -50,6 +50,7 @@ export async function lookupPincodeFromIndiaPost(
         headers: {
           Accept: "application/json",
         },
+        signal: AbortSignal.timeout(3_000),
         // Cache for 24 hours since pincode data rarely changes
         next: { revalidate: 86400 },
       }

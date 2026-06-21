@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Check product delivery availability across India. Get notified when products become available at your pincode.",
   "permissions": ["activeTab", "storage", "notifications", "alarms"],
-  "host_permissions": ["https://www.flipkart.com/*", "https://www.amazon.in/*"],
+  "host_permissions": ["https://www.flipkart.com/*", "https://www.amazon.in/*", "https://price-tracker-india.vercel.app/*"],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {

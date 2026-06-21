@@ -20,7 +20,7 @@ function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function withRetry<T>(fn: () => Promise<T | null>, retries = 2): Promise<T | null> {
+async function withRetry<T>(fn: () => Promise<T | null>, retries = 0): Promise<T | null> {
   for (let i = 0; i <= retries; i++) {
     try {
       const result = await fn();
@@ -28,7 +28,7 @@ async function withRetry<T>(fn: () => Promise<T | null>, retries = 2): Promise<T
     } catch {
       // Ignore and retry
     }
-    if (i < retries) await delay([200, 500][i] || 500);
+    if (i < retries) await delay(500);
   }
   return null;
 }
@@ -212,7 +212,7 @@ async function romeApiFetch(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(12_000),
+    signal: AbortSignal.timeout(4_000),
   });
 
   if (!response.ok) {
@@ -359,7 +359,7 @@ async function pageFetchWithPincode(
       Connection: "keep-alive",
     },
     redirect: "follow",
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(6_000),
   });
 
   if (!response.ok) return null;
@@ -492,6 +492,30 @@ async function pageFetchWithPincode(
     };
   }
 
+  // In-stock fallback: the page has "Buy Now" or "Add to Cart" buttons
+  // but we couldn't find pincode-specific delivery info (Flipkart renders
+  // it dynamically via JS after page load). The product IS available —
+  // we just can't verify pincode delivery from the static HTML.
+  const hasBuySignal =
+    lowerHtml.includes("add to cart") ||
+    lowerHtml.includes("buy now");
+
+  if (hasBuySignal && !isOutOfStock) {
+    return {
+      success: true,
+      productName: null,
+      description: null,
+      imageUrl: null,
+      price: null,
+      pincode,
+      available: true,
+      deliveryInfo: `Available on Flipkart — check delivery for pincode ${pincode} on the product page`,
+      deliveryDate: null,
+      error: null,
+      source: "page_fetch",
+    };
+  }
+
   return null;
 }
 
@@ -539,40 +563,39 @@ export async function checkFlipkartPincodeServiceability(
     source: "fallback",
   };
 
-  // --- Strategy 1: Rome API ---
-  // Try via ScrapingBee proxy first, then direct
-  let romeResult: FlipkartApiResult | null = null;
-  if (process.env.SCRAPINGBEE_API_KEY) {
-    romeResult = await withRetry(() => romeApiFetch(productUrl, pincode, true));
-  }
-  if (!romeResult) {
-    romeResult = await withRetry(() => romeApiFetch(productUrl, pincode, false));
-  }
-  if (romeResult) {
-    console.log(`[Flipkart] Rome API check for ${pincode}: ${romeResult.available ? "✅ Available" : "❌ Not available"}`);
-    return romeResult;
-  }
-
-  await delay(500);
-
-  // --- Strategy 2: Page Fetch ---
-  let pageFetchResult: FlipkartApiResult | null = null;
-  if (process.env.SCRAPINGBEE_API_KEY) {
-    pageFetchResult = await withRetry(() => pageFetchWithPincode(productUrl, pincode, true));
-  }
-  if (!pageFetchResult) {
-    pageFetchResult = await withRetry(() => pageFetchWithPincode(productUrl, pincode, false));
-  }
-  if (pageFetchResult) {
-    console.log(`[Flipkart] Page-fetch check for ${pincode}: ${pageFetchResult.available ? "✅ Available" : "❌ Not available"}`);
-    return pageFetchResult;
+  // Run Rome API and Page Fetch in parallel; return first non-null result
+  async function firstSuccess<T>(promises: Promise<T | null>[]): Promise<T | null> {
+    return new Promise((resolve) => {
+      let settled = 0;
+      for (const p of promises) {
+        p.then((r) => {
+          if (r !== null && r !== undefined) resolve(r);
+        }).catch(() => {});
+        p.finally(() => {
+          settled++;
+          if (settled === promises.length) resolve(null);
+        });
+      }
+    });
   }
 
-  await delay(500);
+  const romePromise = process.env.SCRAPINGBEE_API_KEY
+    ? withRetry(() => romeApiFetch(productUrl, pincode, true))
+    : withRetry(() => romeApiFetch(productUrl, pincode, false));
 
-  // --- Strategy 3: Puppeteer ---
+  const pagePromise = process.env.SCRAPINGBEE_API_KEY
+    ? withRetry(() => pageFetchWithPincode(productUrl, pincode, true))
+    : withRetry(() => pageFetchWithPincode(productUrl, pincode, false));
+
+  const winner = await firstSuccess([romePromise, pagePromise]);
+  if (winner) {
+    console.log(`[Flipkart] Strategy succeeded for ${pincode}: ${winner.available ? "✅ Available" : "❌ Not available"}`);
+    return winner;
+  }
+
+  // If both parallel strategies failed, try Puppeteer as last resort
   try {
-    const puppeteerResult = await withRetry(() => checkViaPuppeteer(productUrl, pincode), 1);
+    const puppeteerResult = await checkViaPuppeteer(productUrl, pincode);
     if (puppeteerResult) {
       console.log(`[Flipkart] Puppeteer check for ${pincode}: ${puppeteerResult.available ? "✅ Available" : "❌ Not available"}`);
       return puppeteerResult;

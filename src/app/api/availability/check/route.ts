@@ -14,12 +14,39 @@ import { eq } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
+const ROUTE_TIMEOUT_MS = 12_000;
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+function corsJson(data: unknown, init?: ResponseInit): Response {
+  return Response.json(data, {
+    ...init,
+    headers: { ...init?.headers, ...CORS_HEADERS },
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Request timed out")), ms)
+    ),
+  ]);
+}
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
 export async function POST(request: Request) {
   try {
     const ip = getClientIp(request);
     const { allowed, retryAfter } = await apiLimiter.check(`check:${ip}`);
     if (!allowed) {
-      return Response.json(
+      return corsJson(
         { error: `Too many requests. Try again in ${retryAfter}s.` },
         { status: 429, headers: { "Retry-After": String(retryAfter) } }
       );
@@ -29,7 +56,7 @@ export async function POST(request: Request) {
     const { productUrl, productName, pincode, checkAll, imageUrl, price, description } = body;
 
     if (!productUrl) {
-      return Response.json(
+      return corsJson(
         { error: "Product URL is required" },
         { status: 400 }
       );
@@ -90,7 +117,7 @@ export async function POST(request: Request) {
     if (platform === "flipkart" || platform === "amazon_india") {
       const available = await isCircuitAvailable(platform);
       if (!available) {
-        return Response.json({
+        return corsJson({
           product,
           circuitBreakerOpen: true,
           error: `Availability checks for ${platform} are temporarily disabled due to repeated failures. Please try again later.`,
@@ -103,7 +130,7 @@ export async function POST(request: Request) {
     const productLimitKey = `product:${product.id}:${ip}`;
     const { allowed: prodAllowed, retryAfter: prodRetryAfter } = await productLimiter.check(productLimitKey);
     if (!prodAllowed) {
-      return Response.json(
+      return corsJson(
         { error: `Too many requests for this product. Try again in ${prodRetryAfter}s.` },
         { status: 429, headers: { "Retry-After": String(prodRetryAfter) } }
       );
@@ -167,7 +194,7 @@ export async function POST(request: Request) {
         (r) => r.confidence === "unknown"
       );
 
-      return Response.json({
+      return corsJson({
         product,
         dataFreshness,
         totalChecked: results.length,
@@ -183,109 +210,117 @@ export async function POST(request: Request) {
     // ── Single pincode check ────────────────────────────────────────────────
     if (pincode) {
       if (!/^\d{6}$/.test(pincode)) {
-        return Response.json(
+        return corsJson(
           { error: "Invalid pincode. Must be 6 digits." },
           { status: 400 }
         );
       }
 
-      const pincodeDetails = await lookupPincodeFromIndiaPost(pincode);
+      const result = await withTimeout(
+        (async () => {
+          const details = await lookupPincodeFromIndiaPost(pincode);
 
-      if (!pincodeDetails?.isValid) {
-        return Response.json({
-          product,
-          dataFreshness,
-          result: {
-            pincode,
-            city: "Unknown",
-            state: "Unknown",
-            available: false,
-            confidence: "unknown",
-            isValidPincode: false,
-          },
-          error: "Invalid or unknown pincode. Please check and try again.",
-          nearestAvailable: [],
-        });
-      }
+          if (!details?.isValid) {
+            return corsJson({
+              product,
+              dataFreshness,
+              result: {
+                pincode,
+                city: "Unknown",
+                state: "Unknown",
+                available: false,
+                confidence: "unknown",
+                isValidPincode: false,
+              },
+              error: "Invalid or unknown pincode. Please check and try again.",
+              nearestAvailable: [],
+            });
+          }
 
-      const result = await checkSinglePincodeAvailability(productUrl, pincode);
+          const availabilityResult = await checkSinglePincodeAvailability(productUrl, pincode);
 
-      // Track circuit breaker
-      if (platform === "flipkart" || platform === "amazon_india") {
-        if (result.confidence === "confirmed") {
-          await recordSuccess(platform);
-        } else if (result.source === "unverified") {
-          await recordFailure(platform);
-        }
-      }
+          // Track circuit breaker
+          if (platform === "flipkart" || platform === "amazon_india") {
+            if (availabilityResult.confidence === "confirmed") {
+              await recordSuccess(platform);
+            } else if (availabilityResult.source === "unverified") {
+              await recordFailure(platform);
+            }
+          }
 
-      // Only persist confirmed results to DB
-      if (result.confidence === "confirmed") {
-        await db
-          .insert(availability)
-          .values({
-            productId: product.id,
-            pincode,
-            city:
-              pincodeDetails.deliveryPostOffice?.Name || pincodeDetails.district,
-            state: pincodeDetails.state,
-            available: result.available,
-            lastChecked: new Date(),
-          })
-          .onConflictDoUpdate({
-            target: [availability.productId, availability.pincode],
-            set: {
-              available: result.available,
-              lastChecked: new Date(),
+          // Only persist confirmed results to DB
+          if (availabilityResult.confidence === "confirmed") {
+            await db
+              .insert(availability)
+              .values({
+                productId: product.id,
+                pincode,
+                city:
+                  details.deliveryPostOffice?.Name || details.district,
+                state: details.state,
+                available: availabilityResult.available,
+                lastChecked: new Date(),
+              })
+              .onConflictDoUpdate({
+                target: [availability.productId, availability.pincode],
+                set: {
+                  available: availabilityResult.available,
+                  lastChecked: new Date(),
+                },
+              });
+          }
+
+          const nearest = await findNearestAvailable(productUrl, pincode, 5);
+
+          return corsJson({
+            product,
+            dataFreshness,
+            result: {
+              pincode,
+              city:
+                details.deliveryPostOffice?.Name || details.district,
+              state: details.state,
+              district: details.district,
+              region: details.region,
+              block: details.block,
+              available: availabilityResult.available,
+              confidence: availabilityResult.confidence,
+              source: availabilityResult.source,
+              deliveryInfo: availabilityResult.deliveryInfo,
+              deliveryDate: availabilityResult.deliveryDate,
+              isValidPincode: true,
+              postOffices: details.postOffices.slice(0, 5).map((po) => ({
+                name: po.Name,
+                type: po.BranchType,
+                delivery: po.DeliveryStatus === "Delivery",
+              })),
             },
+            nearestAvailable: nearest.map((n) => ({
+              pincode: n.pincode,
+              city: n.pincodeDetails?.district || "Unknown",
+              state: n.pincodeDetails?.state || "Unknown",
+              available: n.available,
+              deliveryInfo: n.deliveryInfo,
+              deliveryDate: n.deliveryDate,
+            })),
           });
-      }
+        })(),
+        ROUTE_TIMEOUT_MS
+      );
 
-      const nearest = await findNearestAvailable(productUrl, pincode, 5);
-
-      return Response.json({
-        product,
-        dataFreshness,
-        result: {
-          pincode,
-          city:
-            pincodeDetails.deliveryPostOffice?.Name || pincodeDetails.district,
-          state: pincodeDetails.state,
-          district: pincodeDetails.district,
-          region: pincodeDetails.region,
-          block: pincodeDetails.block,
-          available: result.available,
-          confidence: result.confidence,
-          source: result.source,
-          deliveryInfo: result.deliveryInfo,
-          deliveryDate: result.deliveryDate,
-          isValidPincode: true,
-          postOffices: pincodeDetails.postOffices.slice(0, 5).map((po) => ({
-            name: po.Name,
-            type: po.BranchType,
-            delivery: po.DeliveryStatus === "Delivery",
-          })),
-        },
-        nearestAvailable: nearest.map((n) => ({
-          pincode: n.pincode,
-          city: n.pincodeDetails?.district || "Unknown",
-          state: n.pincodeDetails?.state || "Unknown",
-          available: n.available,
-          deliveryInfo: n.deliveryInfo,
-          deliveryDate: n.deliveryDate,
-        })),
-      });
+      return result;
     }
 
-    return Response.json(
+    return corsJson(
       { error: "Provide either pincode or set checkAll=true" },
       { status: 400 }
     );
   } catch (error) {
     console.error("Error checking availability:", error);
-    return Response.json(
-      { error: "Failed to check availability" },
-      { status: 500 }
+    const isTimeout = error instanceof Error && error.message === "Request timed out";
+    return corsJson(
+      { error: isTimeout ? "Request timed out. Try again later." : "Failed to check availability" },
+      { status: isTimeout ? 503 : 500 }
     );
   }
 }

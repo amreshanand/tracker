@@ -10,6 +10,19 @@ import crypto from "crypto";
 
 export const dynamic = "force-dynamic";
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+function corsJson(data: unknown, init?: ResponseInit): Response {
+  return Response.json(data, {
+    ...init,
+    headers: { ...init?.headers, ...CORS_HEADERS },
+  });
+}
+
 const FREE_TIER_MAX_ALERTS = 5;
 const MAX_REQUEST_BODY_BYTES = 4096;
 const MAX_USERNAME_LENGTH = 100;
@@ -45,7 +58,7 @@ export async function POST(request: Request) {
     // Request size limit
     const contentLength = request.headers.get("content-length");
     if (contentLength && parseInt(contentLength) > MAX_REQUEST_BODY_BYTES) {
-      return Response.json({ error: "Request body too large" }, { status: 413 });
+      return corsJson({ error: "Request body too large" }, { status: 413 });
     }
 
     const body = await request.json();
@@ -55,7 +68,7 @@ export async function POST(request: Request) {
     if (idempotencyKey) {
       const idemp = await checkIdempotency(idempotencyKey);
       if (!idemp.isNew && idemp.existingResponse) {
-        return Response.json(
+        return corsJson(
           idemp.existingResponse.body as Record<string, unknown>,
           { status: idemp.existingResponse.status }
         );
@@ -63,52 +76,52 @@ export async function POST(request: Request) {
     }
 
     if (!userName || !email || !pincode || !productUrl) {
-      return Response.json(
+      return corsJson(
         { error: "Name, email, pincode, and product URL are required" },
         { status: 400 }
       );
     }
 
     if (typeof userName !== "string" || userName.length > MAX_USERNAME_LENGTH || userName.length < 1) {
-      return Response.json({ error: "Name must be 1-100 characters" }, { status: 400 });
+      return corsJson({ error: "Name must be 1-100 characters" }, { status: 400 });
     }
 
     if (typeof email !== "string" || email.length > 254) {
-      return Response.json({ error: "Invalid email address" }, { status: 400 });
+      return corsJson({ error: "Invalid email address" }, { status: 400 });
     }
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return Response.json({ error: "Invalid email address format" }, { status: 400 });
+      return corsJson({ error: "Invalid email address format" }, { status: 400 });
     }
 
     if (isDisposableEmail(email)) {
-      return Response.json({ error: "Disposable email addresses are not allowed" }, { status: 400 });
+      return corsJson({ error: "Disposable email addresses are not allowed" }, { status: 400 });
     }
 
     if (!/^\d{6}$/.test(pincode)) {
-      return Response.json(
+      return corsJson(
         { error: "Invalid pincode. Must be 6 digits." },
         { status: 400 }
       );
     }
 
     if (productUrl.length > 2000) {
-      return Response.json({ error: "Product URL too long" }, { status: 400 });
+      return corsJson({ error: "Product URL too long" }, { status: 400 });
     }
 
     if (productName && (typeof productName !== "string" || productName.length > 500)) {
-      return Response.json({ error: "Product name too long" }, { status: 400 });
+      return corsJson({ error: "Product name too long" }, { status: 400 });
     }
 
     if (targetPrice && (isNaN(parseFloat(targetPrice)) || parseFloat(targetPrice) <= 0)) {
-      return Response.json({ error: "Invalid target price" }, { status: 400 });
+      return corsJson({ error: "Invalid target price" }, { status: 400 });
     }
 
     // Per-email rate limiting
     const ip = getClientIp(request);
     const emailLimit = await emailAlertLimiter.check(`alert:${email}:${ip}`);
     if (!emailLimit.allowed) {
-      return Response.json(
+      return corsJson(
         { error: `Too many alert creations. Try again in ${emailLimit.retryAfter}s.` },
         { status: 429, headers: { "Retry-After": String(emailLimit.retryAfter) } }
       );
@@ -146,7 +159,7 @@ export async function POST(request: Request) {
     if (usage?.plan === "free" && activeCount >= FREE_TIER_MAX_ALERTS) {
       const resp = { error: `Free plan limited to ${FREE_TIER_MAX_ALERTS} active alerts. Upgrade for unlimited.` };
       if (idempotencyKey) await saveIdempotencyResponse(idempotencyKey, 403, resp);
-      return Response.json(resp, { status: 403 });
+      return corsJson(resp, { status: 403 });
     }
 
     // Check existing alert (dedup: email + product + pincode)
@@ -186,7 +199,7 @@ export async function POST(request: Request) {
         alreadyExists: true,
       };
       if (idempotencyKey) await saveIdempotencyResponse(idempotencyKey, 200, resp);
-      return Response.json(resp);
+      return corsJson(resp);
     }
 
     // Create alert (pending email verification)
@@ -245,14 +258,18 @@ export async function POST(request: Request) {
     };
 
     if (idempotencyKey) await saveIdempotencyResponse(idempotencyKey, 200, resp);
-    return Response.json(resp);
+    return corsJson(resp);
   } catch (error) {
     console.error("Error creating alert:", error);
-    return Response.json(
+    return corsJson(
       { error: "Failed to create alert" },
       { status: 500 }
     );
   }
+}
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
 }
 
 export async function GET(request: Request) {
@@ -288,10 +305,10 @@ export async function GET(request: Request) {
 
     const allAlerts = await query;
 
-    return Response.json({ alerts: allAlerts });
+    return corsJson({ alerts: allAlerts });
   } catch (error) {
     console.error("Error fetching alerts:", error);
-    return Response.json(
+    return corsJson(
       { error: "Failed to fetch alerts" },
       { status: 500 }
     );

@@ -1,3 +1,5 @@
+import { fetchWithProxy } from "./scrapingbee";
+
 export interface AmazonCheckResult {
   available: boolean;
   deliveryInfo: string | null;
@@ -21,7 +23,8 @@ export async function checkAmazonAvailability(
   if (asin) {
     try {
       const apiUrl = `https://www.amazon.in/gp/product/ajax?asin=${asin}&deviceType=web&buyingShowHideCheckoutButton=0&merchantId=&locationId=${pincode}&ie=UTF8&action=display&featureId=glow-ingress-itm-offer`;
-      const resp = await fetch(apiUrl, {
+      const fetchFn = process.env.SCRAPINGBEE_API_KEY ? fetchWithProxy : fetch;
+      const resp = await fetchFn(apiUrl, {
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -80,18 +83,19 @@ export async function checkAmazonAvailability(
 
   // Strategy B: Fetch product page
   try {
-    const resp = await fetch(productUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        Cookie: "i18n-prefs=INR; lc-acbin=en_IN; gl=IN;",
-        Referer: "https://www.amazon.in/",
-      },
-      signal: AbortSignal.timeout(15_000),
-    });
+      const fetchFn = process.env.SCRAPINGBEE_API_KEY ? fetchWithProxy : fetch;
+      const resp = await fetchFn(productUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+          "Accept-Language": "en-IN,en;q=0.9",
+          Cookie: "i18n-prefs=INR; lc-acbin=en_IN; gl=IN;",
+          Referer: "https://www.amazon.in/",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
     const html = await resp.text();
     const lowerHtml = html.toLowerCase();
 

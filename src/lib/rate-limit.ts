@@ -1,34 +1,62 @@
-export function createRateLimiter(windowMs = 60_000, maxRequests = 15) {
-  const hits = new Map<string, { count: number; resetAt: number }>();
+import { db } from "@/db";
+import { rateLimits } from "@/db/schema";
+import { eq, sql, and } from "drizzle-orm";
 
-  if (typeof setInterval !== "undefined") {
-    setInterval(() => {
-      const now = Date.now();
-      for (const [key, val] of hits) {
-        if (val.resetAt < now) hits.delete(key);
-      }
-    }, windowMs * 2).unref?.();
+const CLEANUP_INTERVAL_MS = 60_000;
+let lastCleanup = 0;
+
+async function cleanupExpired() {
+  const now = Date.now();
+  if (now - lastCleanup < CLEANUP_INTERVAL_MS) return;
+  lastCleanup = now;
+  try {
+    await db.delete(rateLimits).where(sql`${rateLimits.resetAt} < now()`);
+  } catch {
+    // Non-critical
   }
+}
 
+export function createRateLimiter(windowMs = 60_000, maxRequests = 15) {
   return {
-    check(key: string): { allowed: boolean; retryAfter: number } {
-      const now = Date.now();
-      const entry = hits.get(key);
+    async check(key: string): Promise<{ allowed: boolean; retryAfter: number }> {
+      cleanupExpired();
 
-      if (!entry || entry.resetAt < now) {
-        hits.set(key, { count: 1, resetAt: now + windowMs });
+      const now = new Date();
+      const resetAt = new Date(now.getTime() + windowMs);
+
+      try {
+        const result = await db
+          .insert(rateLimits)
+          .values({ key, count: 1, resetAt })
+          .onConflictDoUpdate({
+            target: rateLimits.key,
+            set: {
+              count: sql`${rateLimits.count} + 1`,
+              updatedAt: now,
+            },
+          })
+          .returning({ count: rateLimits.count, resetAt: rateLimits.resetAt });
+
+        const entry = result[0];
+        if (entry.count > maxRequests) {
+          const retryAfter = Math.ceil((entry.resetAt.getTime() - now.getTime()) / 1000);
+          return { allowed: false, retryAfter: Math.max(retryAfter, 1) };
+        }
+
+        return { allowed: true, retryAfter: 0 };
+      } catch {
         return { allowed: true, retryAfter: 0 };
       }
-
-      entry.count++;
-      if (entry.count > maxRequests) {
-        return { allowed: false, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
-      }
-
-      return { allowed: true, retryAfter: 0 };
     },
-    _hits: hits,
   };
 }
 
 export const apiLimiter = createRateLimiter(60_000, 15);
+export const emailAlertLimiter = createRateLimiter(60_000, 5);
+export const cronLimiter = createRateLimiter(60_000, 3);
+
+export function getClientIp(request: Request): string {
+  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+    || request.headers.get("x-real-ip")
+    || "unknown";
+}

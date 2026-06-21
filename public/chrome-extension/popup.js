@@ -1,4 +1,4 @@
-const API_BASE_URL = 'https://your-app-url.com';
+const API_BASE_URL = 'https://price-tracker-india.vercel.app';
 
 const productInfo = document.getElementById('product-info');
 const pincodeInput = document.getElementById('pincode');
@@ -7,6 +7,7 @@ const resultsDiv = document.getElementById('results');
 const notifyName = document.getElementById('notifyName');
 const notifyEmail = document.getElementById('notifyEmail');
 const notifyPincode = document.getElementById('notifyPincode');
+const notifyTargetPrice = document.getElementById('notifyTargetPrice');
 const notifyBtn = document.getElementById('notifyBtn');
 const notifyMessage = document.getElementById('notifyMessage');
 
@@ -49,6 +50,18 @@ async function safeJson(response) {
     return JSON.parse(text);
   } catch {
     return { error: `Unexpected response (${response.status}). Please try again.` };
+  }
+}
+
+async function trackEvent(event, metadata) {
+  try {
+    await fetchWithTimeout(`${API_BASE_URL}/api/analytics/track`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, ...metadata }),
+    }, 3000);
+  } catch {
+    // Non-critical
   }
 }
 
@@ -104,6 +117,7 @@ function displayProduct(product) {
     <span class="product-platform">${product.platform === 'flipkart' ? 'Flipkart' : 'Amazon India'}</span>
     ${product.price ? `<span style="margin-left: 8px; font-weight: 600;">${escapeHtml(product.price)}</span>` : ''}
   `;
+  trackEvent('product_detected', { productId: product.url });
 }
 
 async function checkAvailability() {
@@ -123,34 +137,22 @@ async function checkAvailability() {
   resultsDiv.innerHTML = '<div class="loading"><div class="spinner"></div>Checking availability...</div>';
 
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-    let result;
-    try {
-      result = await chrome.tabs.sendMessage(tab.id, {
-        action: 'checkDelivery',
+    const response = await fetchWithRetry(`${API_BASE_URL}/api/availability/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        productUrl: currentProduct.url,
+        productName: currentProduct.name,
         pincode: pincode
-      });
-    } catch {
-      result = null;
-    }
+      })
+    });
 
-    if (result && result.checked) {
-      displayResult(result, pincode);
-    } else {
-      const response = await fetchWithRetry(`${API_BASE_URL}/api/availability/check`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          productUrl: currentProduct.url,
-          productName: currentProduct.name,
-          pincode: pincode
-        })
-      });
+    const data = await safeJson(response);
+    displayAPIResult(data, pincode);
+    trackEvent('availability_checked', { pincode, platform: currentProduct.platform });
 
-      const data = await safeJson(response);
-      displayAPIResult(data);
-    }
+    // Save pincode for next time
+    chrome.storage.local.set({ savedPincode: pincode });
   } catch (error) {
     if (error && error.name === 'AbortError') {
       resultsDiv.innerHTML = '<div class="message error">Request timed out. Please try again.</div>';
@@ -162,24 +164,7 @@ async function checkAvailability() {
   }
 }
 
-function displayResult(result, pincode) {
-  const statusClass = result.available ? 'available' : 'unavailable';
-  const statusText = result.available ? 'Available' : 'Not Available';
-  const statusBadge = result.available ? 'yes' : 'no';
-
-  resultsDiv.innerHTML = `
-    <div class="result-item ${statusClass}">
-      <div>
-        <div class="result-city">Pincode ${escapeHtml(pincode)}</div>
-        <div class="result-pincode">${escapeHtml(result.deliveryInfo || (result.available ? 'Delivery available' : 'Not serviceable'))}</div>
-      </div>
-      <span class="result-status ${statusBadge}">${statusText}</span>
-    </div>
-    ${!result.available ? '<p style="font-size: 12px; color: #64748b; margin-top: 12px;">Switch to "Notify Me" tab to get alerts when available.</p>' : ''}
-  `;
-}
-
-function displayAPIResult(data) {
+function displayAPIResult(data, pincode) {
   if (!data) {
     resultsDiv.innerHTML = '<div class="message error">No response from server. Please try again.</div>';
     return;
@@ -194,16 +179,28 @@ function displayAPIResult(data) {
     const r = data.result;
     const statusClass = r.available ? 'available' : 'unavailable';
     const statusBadge = r.available ? 'yes' : 'no';
+    const statusText = r.available ? 'In Stock ✓' : (r.confidence === 'unknown' ? 'Could not verify' : 'Not Available');
 
     let html = `
       <div class="result-item ${statusClass}">
         <div>
-          <div class="result-city">${escapeHtml(r.city || r.district)}, ${escapeHtml(r.state)}</div>
+          <div class="result-city">${escapeHtml(r.city || r.district || 'Your location')}</div>
           <div class="result-pincode">Pincode: ${escapeHtml(r.pincode)}</div>
         </div>
-        <span class="result-status ${statusBadge}">${r.available ? 'Available' : 'Not Available'}</span>
+        <span class="result-status ${statusBadge}">${statusText}</span>
       </div>
     `;
+
+    // One-click CTA: set price alert after availability check
+    if (r.available) {
+      html += `<button class="btn btn-secondary" id="quickAlertBtn" style="margin-top:12px;">🔔 Set Price Alert</button>`;
+    } else {
+      html += `<div style="margin-top:12px;font-size:13px;color:#64748b;">
+        ${r.deliveryInfo ? escapeHtml(r.deliveryInfo) : 'Not currently available at this pincode.'}
+        <br><br>
+        <button class="btn btn-secondary" id="quickAlertBtn">🔔 Notify me when back in stock</button>
+      </div>`;
+    }
 
     if (data.nearestAvailable && data.nearestAvailable.length > 0 && !r.available) {
       html += '<p class="section-title" style="margin-top: 16px;">Nearest Available:</p>';
@@ -221,10 +218,30 @@ function displayAPIResult(data) {
     }
 
     resultsDiv.innerHTML = html;
+
+    // Wire up the quick alert button
+    const quickBtn = document.getElementById('quickAlertBtn');
+    if (quickBtn) {
+      quickBtn.addEventListener('click', () => {
+        // Pre-fill notify form with detected values
+        notifyPincode.value = pincode;
+        // Auto-suggest target price 10% below current
+        if (currentProduct && currentProduct.price) {
+          const priceNum = parseFloat(currentProduct.price.replace(/[^0-9.]/g, ''));
+          if (!isNaN(priceNum)) {
+            notifyTargetPrice.value = Math.round(priceNum * 0.9);
+          }
+        }
+        // Switch to notify tab
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        document.querySelector('[data-tab="notify"]').classList.add('active');
+        document.getElementById('tab-notify').classList.add('active');
+      });
+    }
     return;
   }
 
-  // Unknown response shape
   resultsDiv.innerHTML = '<div class="message error">Unexpected response format. Please try again.</div>';
 }
 
@@ -247,6 +264,8 @@ async function submitNotification() {
   notifyMessage.innerHTML = '<div class="loading"><div class="spinner"></div>Submitting...</div>';
 
   try {
+    const targetPrice = notifyTargetPrice.value.trim() ? parseFloat(notifyTargetPrice.value.trim()) : null;
+
     const response = await fetchWithRetry(`${API_BASE_URL}/api/alerts`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -255,16 +274,27 @@ async function submitNotification() {
         email: email,
         pincode: pincode,
         productUrl: currentProduct.url,
-        productName: currentProduct.name
+        productName: currentProduct.name,
+        targetPrice: targetPrice
       })
     });
 
     const data = await safeJson(response);
 
     if (data.error) {
-      notifyMessage.innerHTML = `<div class="message error">${escapeHtml(data.error)}</div>`;
+      if (data.error.includes('Free plan')) {
+        notifyMessage.innerHTML = `<div class="message error">⚠️ ${escapeHtml(data.error)}</div>`;
+      } else {
+        notifyMessage.innerHTML = `<div class="message error">${escapeHtml(data.error)}</div>`;
+      }
     } else {
       notifyMessage.innerHTML = `<div class="message success">✓ ${escapeHtml(data.message || 'Alert created!')}</div>`;
+      if (data.usage) {
+        const usageDiv = document.createElement('div');
+        usageDiv.style.cssText = 'font-size:12px;color:#64748b;margin-top:8px;text-align:center;';
+        usageDiv.textContent = `${data.usage.activeAlerts}/${data.usage.plan === 'free' ? 5 : '∞'} alerts used`;
+        notifyMessage.appendChild(usageDiv);
+      }
       chrome.storage.local.get(['alerts'], (result) => {
         const alerts = result.alerts || [];
         alerts.push({
@@ -276,6 +306,7 @@ async function submitNotification() {
         });
         chrome.storage.local.set({ alerts });
       });
+      trackEvent('alert_created', { pincode, platform: currentProduct.platform });
     }
   } catch (error) {
     notifyMessage.innerHTML = `<div class="message error">Error: ${escapeHtml(error && error.message || 'Could not reach server')}</div>`;
@@ -301,9 +332,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   currentProduct = await getCurrentProduct();
   displayProduct(currentProduct);
 
-  chrome.storage.local.get(['savedEmail', 'savedName'], (result) => {
+  chrome.storage.local.get(['savedEmail', 'savedName', 'savedPincode'], (result) => {
     if (result.savedEmail) notifyEmail.value = result.savedEmail;
     if (result.savedName) notifyName.value = result.savedName;
+    // Auto-fill pincode from last check
+    if (result.savedPincode) pincodeInput.value = result.savedPincode;
+  });
+
+  // Track popup open
+  trackEvent('popup_open', { hasProduct: !!currentProduct });
+
+  // Track install (only once)
+  chrome.storage.local.get(['installTracked'], (result) => {
+    if (!result.installTracked) {
+      trackEvent('install');
+      chrome.storage.local.set({ installTracked: true });
+    }
   });
 });
 

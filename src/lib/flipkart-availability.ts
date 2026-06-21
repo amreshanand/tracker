@@ -1,4 +1,5 @@
 import { extractFlipkartProductId } from "./flipkart-api-checker";
+import { fetchWithProxy } from "./scrapingbee";
 
 export interface FlipkartApiResult {
   success: boolean;
@@ -330,7 +331,8 @@ async function checkViaPageFetchWithPincode(
   pincode: string
 ): Promise<FlipkartApiResult | null> {
   try {
-    const response = await fetch(productUrl, {
+    const fetchFn = process.env.SCRAPINGBEE_API_KEY ? fetchWithProxy : fetch;
+    const response = await fetchFn(productUrl, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",

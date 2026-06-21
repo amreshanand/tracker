@@ -8,16 +8,15 @@ import {
   getMajorCityPincodes,
   findNearestAvailable,
 } from "@/lib/availability-service";
-import { apiLimiter } from "@/lib/rate-limit";
+import { apiLimiter, getClientIp } from "@/lib/rate-limit";
+import { isCircuitAvailable, recordSuccess, recordFailure } from "@/lib/circuit-breaker";
 import { eq } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   try {
-    const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-      || request.headers.get("x-real-ip")
-      || "unknown";
+    const ip = getClientIp(request);
     const { allowed, retryAfter } = apiLimiter.check(`check:${ip}`);
     if (!allowed) {
       return Response.json(
@@ -85,6 +84,31 @@ export async function POST(request: Request) {
     }
 
     const product = productRecord[0];
+    const platform = detectPlatform(productUrl);
+
+    // Circuit breaker check
+    if (platform === "flipkart" || platform === "amazon_india") {
+      const available = await isCircuitAvailable(platform);
+      if (!available) {
+        return Response.json({
+          product,
+          circuitBreakerOpen: true,
+          error: `Availability checks for ${platform} are temporarily disabled due to repeated failures. Please try again later.`,
+          platform,
+        });
+      }
+    }
+
+    // Data freshness: include metadata about last scrape
+    const dataFreshness = product.lastScrapedAt
+      ? {
+          lastUpdated: product.lastScrapedAt,
+          ageHours: Math.round((Date.now() - new Date(product.lastScrapedAt).getTime()) / (1000 * 60 * 60)),
+          isStale: product.lastScrapedAt
+            ? (Date.now() - new Date(product.lastScrapedAt).getTime()) > 24 * 60 * 60 * 1000
+            : true,
+        }
+      : { lastUpdated: null, ageHours: null, isStale: true };
 
     // ── Check all major cities ──────────────────────────────────────────────
     if (checkAll) {
@@ -135,6 +159,7 @@ export async function POST(request: Request) {
 
       return Response.json({
         product,
+        dataFreshness,
         totalChecked: results.length,
         availableCount: availableResults.length,
         unavailableCount: unavailableResults.length,
@@ -159,6 +184,7 @@ export async function POST(request: Request) {
       if (!pincodeDetails?.isValid) {
         return Response.json({
           product,
+          dataFreshness,
           result: {
             pincode,
             city: "Unknown",
@@ -173,6 +199,15 @@ export async function POST(request: Request) {
       }
 
       const result = await checkSinglePincodeAvailability(productUrl, pincode);
+
+      // Track circuit breaker
+      if (platform === "flipkart" || platform === "amazon_india") {
+        if (result.confidence === "confirmed") {
+          await recordSuccess(platform);
+        } else if (result.source === "unverified") {
+          await recordFailure(platform);
+        }
+      }
 
       // Only persist confirmed results to DB
       if (result.confidence === "confirmed") {
@@ -200,6 +235,7 @@ export async function POST(request: Request) {
 
       return Response.json({
         product,
+        dataFreshness,
         result: {
           pincode,
           city:

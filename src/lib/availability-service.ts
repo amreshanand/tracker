@@ -18,7 +18,10 @@ import { fetchFlipkartProductDetails } from "./flipkart-api-checker";
 import { checkAmazonAvailability } from "./amazon-checker";
 import { db } from "@/db";
 import { products as productsTable, availability as availabilityTable } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
+import { isCircuitAvailable, recordSuccess, recordFailure } from "./circuit-breaker";
+
+const STRATEGY_TIMEOUT = 8000; // 8s per strategy before fallback
 
 export interface AvailabilityCheckResult {
   pincode: string;
@@ -69,20 +72,78 @@ async function getProductPageData(productUrl: string, platform: string) {
     return cached;
   }
 
-  if (platform === "flipkart") {
-    const details = await fetchFlipkartProductDetails(productUrl);
-    const data = {
-      isGloballyOutOfStock: details.isGloballyOutOfStock,
-      globallyAvailable: details.available,
-      html: details.html,
-      name: details.name,
-      price: details.price,
-      imageUrl: details.imageUrl,
-      description: details.description,
-      fetchedAt: new Date(),
-    };
-    productPageCache.set(productUrl, data);
-    return data;
+  if (platform === "flipkart" || platform === "amazon_india") {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), STRATEGY_TIMEOUT);
+
+      const details = await fetchFlipkartProductDetails(productUrl);
+      clearTimeout(timeout);
+
+      const data = {
+        isGloballyOutOfStock: details.isGloballyOutOfStock,
+        globallyAvailable: details.available,
+        html: details.html,
+        name: details.name,
+        price: details.price,
+        imageUrl: details.imageUrl,
+        description: details.description,
+        fetchedAt: new Date(),
+      };
+      productPageCache.set(productUrl, data);
+
+      // Persist to DB for cache resilience
+      try {
+        await db
+          .update(productsTable)
+          .set({
+            name: details.name || undefined,
+            price: details.price || undefined,
+            imageUrl: details.imageUrl || undefined,
+            description: details.description || undefined,
+            lastScrapedAt: new Date(),
+            scrapeError: null,
+          })
+          .where(eq(productsTable.url, productUrl));
+      } catch {
+        // Non-critical
+      }
+
+      return data;
+    } catch {
+      // Strategy failed — try DB cache
+      try {
+        const [cachedProduct] = await db
+          .select({
+            name: productsTable.name,
+            price: productsTable.price,
+            imageUrl: productsTable.imageUrl,
+            description: productsTable.description,
+            lastScrapedAt: productsTable.lastScrapedAt,
+          })
+          .from(productsTable)
+          .where(eq(productsTable.url, productUrl))
+          .limit(1);
+
+        if (cachedProduct?.lastScrapedAt) {
+          const cachedAge = Date.now() - new Date(cachedProduct.lastScrapedAt).getTime();
+          if (cachedAge < 24 * 60 * 60 * 1000) {
+            return {
+              isGloballyOutOfStock: false,
+              globallyAvailable: true,
+              html: "",
+              name: cachedProduct.name,
+              price: cachedProduct.price,
+              imageUrl: cachedProduct.imageUrl,
+              description: cachedProduct.description,
+              fetchedAt: new Date(cachedProduct.lastScrapedAt),
+            };
+          }
+        }
+      } catch {
+        // DB cache miss
+      }
+    }
   }
 
   return null;
@@ -144,6 +205,26 @@ export async function checkSinglePincodeAvailability(
 ): Promise<AvailabilityCheckResult> {
   const pincodeDetails = await lookupPincodeFromIndiaPost(pincode);
   const platform = detectPlatform(productUrl);
+
+  // Circuit breaker gate — skip if provider is open
+  if (platform === "flipkart" || platform === "amazon_india") {
+    const circuitOk = await isCircuitAvailable(platform);
+    if (!circuitOk) {
+      const loc = pincodeDetails?.isValid
+        ? `${pincodeDetails.district}, ${pincodeDetails.state}`
+        : pincode;
+      return {
+        pincode,
+        pincodeDetails,
+        available: false,
+        deliveryInfo: `${platform} checks are temporarily disabled due to repeated failures. Please try again later (${loc}).`,
+        deliveryDate: null,
+        checkedAt: new Date(),
+        source: "unverified",
+        confidence: "unknown",
+      };
+    }
+  }
 
   // Check DB cache first (avoids hitting Flipkart/Amazon for recently-checked products)
   if (!options?.skipCache) {
@@ -240,6 +321,7 @@ export async function checkSinglePincodeAvailability(
       const result = await checkFlipkartPincodeServiceability(productUrl, pincode);
 
       if (result.success) {
+        await recordSuccess("flipkart");
         const checkResult: AvailabilityCheckResult = {
           pincode,
           pincodeDetails,
@@ -271,6 +353,7 @@ export async function checkSinglePincodeAvailability(
       }
     } catch (err) {
       console.error("Flipkart serviceability check error:", err);
+      await recordFailure("flipkart");
       const loc = pincodeDetails?.isValid
         ? `${pincodeDetails.district}, ${pincodeDetails.state}`
         : pincode;
@@ -290,6 +373,7 @@ export async function checkSinglePincodeAvailability(
   if (platform === "amazon_india") {
     try {
       const amazonResult = await checkAmazonAvailability(productUrl, pincode);
+      await recordSuccess("amazon_india");
       const amazonCheckResult: AvailabilityCheckResult = {
         pincode,
         pincodeDetails,
@@ -304,6 +388,7 @@ export async function checkSinglePincodeAvailability(
       return amazonCheckResult;
     } catch (err) {
       console.error("Amazon serviceability check error:", err);
+      await recordFailure("amazon_india");
       return {
         pincode,
         pincodeDetails,

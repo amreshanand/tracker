@@ -1,14 +1,56 @@
 import { db } from "@/db";
-import { alerts, products } from "@/db/schema";
+import { alerts, products, userUsage, analyticsEvents } from "@/db/schema";
 import { detectPlatform } from "@/lib/platform";
-import { eq, desc, and } from "drizzle-orm";
+import { eq, desc, and, sql } from "drizzle-orm";
+import { emailAlertLimiter, getClientIp } from "@/lib/rate-limit";
+import { checkIdempotency, saveIdempotencyResponse } from "@/lib/idempotency";
+import { sendEmail } from "@/lib/email-service";
+import crypto from "crypto";
 
 export const dynamic = "force-dynamic";
+
+const FREE_TIER_MAX_ALERTS = 5;
+
+function getBaseUrl(request: Request): string {
+  const url = new URL(request.url);
+  return `${url.protocol}//${url.host}`;
+}
+
+function generateVerificationToken(): string {
+  return crypto.randomUUID();
+}
+
+async function sendVerificationEmail(email: string, token: string, baseUrl: string, productName: string) {
+  const verifyUrl = `${baseUrl}/api/alerts/verify?token=${token}`;
+  await sendEmail({
+    to: email,
+    subject: "Verify your email for Product Availability Tracker",
+    html: `
+      <h2>Verify your email address</h2>
+      <p>You've created an availability alert for <strong>${productName}</strong>.</p>
+      <p>Click the link below to verify your email and activate the alert:</p>
+      <p><a href="${verifyUrl}" style="display:inline-block;padding:12px 24px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:6px;">Verify Email & Activate Alert</a></p>
+      <p>If you didn't create this alert, you can ignore this email.</p>
+    `,
+    text: `Verify your email for Product Availability Tracker\n\nYou've created an availability alert for ${productName}.\n\nClick this link to verify your email and activate the alert:\n${verifyUrl}\n\nIf you didn't create this alert, ignore this email.`,
+  });
+}
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { userName, email, pincode, productUrl, productName } = body;
+    const { userName, email, pincode, productUrl, productName, targetPrice, idempotencyKey } = body;
+
+    // Idempotency check
+    if (idempotencyKey) {
+      const idemp = await checkIdempotency(idempotencyKey);
+      if (!idemp.isNew && idemp.existingResponse) {
+        return Response.json(
+          idemp.existingResponse.body as Record<string, unknown>,
+          { status: idemp.existingResponse.status }
+        );
+      }
+    }
 
     if (!userName || !email || !pincode || !productUrl) {
       return Response.json(
@@ -17,17 +59,24 @@ export async function POST(request: Request) {
       );
     }
 
-    // Validate email
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return Response.json({ error: "Invalid email address" }, { status: 400 });
     }
 
-    // Validate pincode (6 digits for India)
     if (!/^\d{6}$/.test(pincode)) {
       return Response.json(
         { error: "Invalid pincode. Must be 6 digits." },
         { status: 400 }
+      );
+    }
+
+    // Per-email rate limiting
+    const ip = getClientIp(request);
+    const emailLimit = emailAlertLimiter.check(`alert:${email}:${ip}`);
+    if (!emailLimit.allowed) {
+      return Response.json(
+        { error: `Too many alert creations. Try again in ${emailLimit.retryAfter}s.` },
+        { status: 429, headers: { "Retry-After": String(emailLimit.retryAfter) } }
       );
     }
 
@@ -52,7 +101,21 @@ export async function POST(request: Request) {
 
     const product = productRecord[0];
 
-    // Check if alert already exists for this email + product + pincode
+    // Check free tier limit
+    const [usage] = await db
+      .select({ activeAlerts: userUsage.activeAlerts, plan: userUsage.plan })
+      .from(userUsage)
+      .where(eq(userUsage.email, email))
+      .limit(1);
+
+    const activeCount = usage?.activeAlerts ?? 0;
+    if (usage?.plan === "free" && activeCount >= FREE_TIER_MAX_ALERTS) {
+      const resp = { error: `Free plan limited to ${FREE_TIER_MAX_ALERTS} active alerts. Upgrade for unlimited.` };
+      if (idempotencyKey) await saveIdempotencyResponse(idempotencyKey, 403, resp);
+      return Response.json(resp, { status: 403 });
+    }
+
+    // Check existing alert (dedup: email + product + pincode)
     const existingAlert = await db
       .select()
       .from(alerts)
@@ -66,35 +129,87 @@ export async function POST(request: Request) {
       .limit(1);
 
     if (existingAlert.length > 0) {
-      // Reactivate if it was deactivated
       if (!existingAlert[0].active) {
-        await db
-          .update(alerts)
-          .set({ active: true, notified: false })
-          .where(eq(alerts.id, existingAlert[0].id));
+        const wasVerified = existingAlert[0].emailVerified !== false;
+        if (wasVerified) {
+          await db
+            .update(alerts)
+            .set({ active: true, notified: false })
+            .where(eq(alerts.id, existingAlert[0].id));
+        } else {
+          const token = generateVerificationToken();
+          await db
+            .update(alerts)
+            .set({ verificationToken: token, notified: false })
+            .where(eq(alerts.id, existingAlert[0].id));
+          const baseUrl = getBaseUrl(request);
+          sendVerificationEmail(email, token, baseUrl, productName || "product");
+        }
       }
-      return Response.json({
+      const resp = {
         alert: existingAlert[0],
         message: "Alert already exists for this product and pincode",
         alreadyExists: true,
-      });
+      };
+      if (idempotencyKey) await saveIdempotencyResponse(idempotencyKey, 200, resp);
+      return Response.json(resp);
     }
 
-    const newAlert = await db
+    // Create alert (pending email verification)
+    const verificationToken = generateVerificationToken();
+    const [newAlert] = await db
       .insert(alerts)
       .values({
         userName,
         email,
         pincode,
         productId: product.id,
+        targetPrice: targetPrice ? parseFloat(targetPrice) : null,
+        emailVerified: false,
+        active: false,
+        verificationToken,
       })
       .returning();
 
-    return Response.json({
-      alert: newAlert[0],
-      message: "Alert created successfully! We'll notify you when the product becomes available.",
-      alreadyExists: false,
+    // Update user usage counters
+    await db
+      .insert(userUsage)
+      .values({
+        email,
+        activeAlerts: 1,
+        totalAlertsCreated: 1,
+      })
+      .onConflictDoUpdate({
+        target: userUsage.email,
+        set: {
+          activeAlerts: sql`${userUsage.activeAlerts} + 1`,
+          totalAlertsCreated: sql`${userUsage.totalAlertsCreated} + 1`,
+          updatedAt: new Date(),
+        },
+      });
+
+    // Send verification email (fire-and-forget)
+    const baseUrl = getBaseUrl(request);
+    sendVerificationEmail(email, verificationToken, baseUrl, product.name);
+
+    // Track analytics event
+    await db.insert(analyticsEvents).values({
+      event: "alert_created",
+      email,
+      productId: product.id,
+      metadata: JSON.stringify({ platform: product.platform, pincode, hasTargetPrice: !!targetPrice }),
     });
+
+    const resp = {
+      alert: { ...newAlert, verificationToken: undefined },
+      message: "Alert created! Please check your email to verify and activate the alert.",
+      alreadyExists: false,
+      emailVerificationRequired: true,
+      usage: { activeAlerts: activeCount + 1, plan: usage?.plan || "free" },
+    };
+
+    if (idempotencyKey) await saveIdempotencyResponse(idempotencyKey, 200, resp);
+    return Response.json(resp);
   } catch (error) {
     console.error("Error creating alert:", error);
     return Response.json(
@@ -115,6 +230,7 @@ export async function GET(request: Request) {
         userName: alerts.userName,
         email: alerts.email,
         pincode: alerts.pincode,
+        targetPrice: alerts.targetPrice,
         notified: alerts.notified,
         active: alerts.active,
         createdAt: alerts.createdAt,

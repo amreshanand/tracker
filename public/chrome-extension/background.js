@@ -1,4 +1,4 @@
-const API_BASE_URL = 'https://your-app-url.com';
+const API_BASE_URL = 'https://price-tracker-india.vercel.app';
 const MAX_RETRIES = 2;
 
 async function fetchWithRetry(url, options = {}, retries = MAX_RETRIES) {
@@ -8,7 +8,7 @@ async function fetchWithRetry(url, options = {}, retries = MAX_RETRIES) {
     try {
       const response = await fetch(url, { ...options, signal: controller.signal });
       if (response.ok) return response;
-      if (response.status < 500) return response; // don't retry 4xx
+      if (response.status < 500) return response;
     } catch {
       if (i >= retries) throw new Error('Request failed after retries');
     } finally {
@@ -47,7 +47,7 @@ async function processAlerts() {
     const data = await safeJson(response);
 
     if (data.results && data.results.notified > 0) {
-      const notified = data.results.notifications.filter(n => n.status === 'notified');
+      const notified = data.results.notifications ? data.results.notifications.filter(n => n.status === 'notified') : [];
       notified.forEach(notification => {
         chrome.notifications.create({
           type: 'basic',

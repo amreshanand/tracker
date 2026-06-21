@@ -8,7 +8,12 @@
  * Strategy waterfall (each tried in order, stops at first definitive answer):
  *  A. Rome API  — POST 1.rome.api.flipkart.com/api/4/page/fetch
  *  B. Product page fetch with X-Pincode header (mobile BFF)
- *  C. Puppeteer browser automation (most reliable, used as last resort)
+ *  C. __NEXT_DATA__ / __INITIAL_STATE__ parsing from page HTML
+ *  D. Puppeteer browser automation (most reliable, used as last resort)
+ *
+ * IMPORTANT: All keyword-based checks require that the pincode text appears
+ * NEAR the delivery signal — never match "free delivery" in the global
+ * site chrome. This was the root cause of false positives in prior versions.
  */
 
 export interface FlipkartApiResult {
@@ -23,7 +28,7 @@ export interface FlipkartApiResult {
   deliveryDate: string | null;
   error: string | null;
   /** Which strategy produced this result */
-  source: "rome_api" | "page_fetch" | "puppeteer" | "fallback";
+  source: "rome_api" | "page_fetch" | "next_data" | "puppeteer" | "fallback";
   isGloballyOutOfStock?: boolean;
 }
 
@@ -263,30 +268,115 @@ export async function fetchFlipkartProductDetails(productUrl: string): Promise<{
 // ---------------------------------------------------------------------------
 
 /**
+ * Recursively walk the Rome API response JSON to find the delivery widget
+ * that contains pincode-specific serviceability data.
+ *
+ * Returns the first string value found within the delivery section, or null
+ * if no delivery-related section can be identified.
+ */
+function findDeliverySectionText(
+  obj: unknown,
+  depth: number = 0
+): string[] {
+  if (depth > 20 || obj == null) return [];
+  const results: string[] = [];
+
+  if (typeof obj === "string") {
+    const lower = obj.toLowerCase();
+    if (
+      lower.includes("delivery") ||
+      lower.includes("pincode") ||
+      lower.includes("serviceable") ||
+      lower.includes("servicable") ||
+      lower.includes("deliverable")
+    ) {
+      results.push(obj);
+    }
+    return results;
+  }
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      results.push(...findDeliverySectionText(item, depth + 1));
+    }
+    return results;
+  }
+
+  if (typeof obj === "object") {
+    for (const [key, value] of Object.entries(obj)) {
+      const keyLower = key.toLowerCase();
+      // Skip large non-delivery sections to avoid false matches
+      if (
+        keyLower.includes("seo") ||
+        keyLower.includes("navigation") ||
+        keyLower.includes("footer") ||
+        keyLower.includes("header") ||
+        keyLower.includes("banner") ||
+        keyLower.includes("advertisement")
+      ) {
+        continue;
+      }
+      if (typeof value === "string" || typeof value === "object") {
+        results.push(...findDeliverySectionText(value, depth + 1));
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
  * Parse delivery info from Flipkart's Rome API JSON response.
  * The Rome API wraps page widgets as JSON — we look for the DELIVERY slot.
+ *
+ * CRITICAL FIX: Instead of matching keywords across the ENTIRE response
+ * (which caused false positives like "free delivery" from site chrome),
+ * we now:
+ *  1. Walk the JSON to find text near delivery/pincode keywords
+ *  2. Require pincode context for delivery signals
+ *  3. Prioritize structured serviceability fields
  */
 function parseRomeApiResponse(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  data: any,
+  data: unknown,
   pincode: string
 ): { available: boolean; deliveryInfo: string | null; deliveryDate: string | null } | null {
   try {
-    // The response is a deeply nested widget tree. We flatten and search.
-    const json = JSON.stringify(data).toLowerCase();
+    const dataStr = JSON.stringify(data);
+    const lowerJson = dataStr.toLowerCase();
 
-    // Explicit not-serviceable signals
-    const notServiceableKeywords = [
-      "not serviceable",
-      "not deliverable",
-      "cannot be delivered",
-      "no sellers deliver",
-      "pincode is not serviceable",
-      "delivery not available",
-      "doesn't deliver to",
-      "does not deliver to",
-    ];
-    if (notServiceableKeywords.some((k) => json.includes(k))) {
+    // ── Priority 1: Structured serviceability flags ──────────────────────
+    // Only match if these exist in a delivery/pincode context
+    const hasServiceableTrue =
+      dataStr.includes('"isServiceable":true') ||
+      dataStr.includes('"deliveryPromise"') ||
+      dataStr.includes('"serviceable":true');
+
+    const hasServiceableFalse =
+      dataStr.includes('"isServiceable":false') ||
+      dataStr.includes('"serviceable":false');
+
+    // ── Priority 2: Pincode-specific delivery text from relevant sections ─
+    const deliveryTexts = findDeliverySectionText(data);
+
+    // Look for the pincode near delivery keywords
+    const pincodeNearDelivery = deliveryTexts.some(
+      (t) =>
+        t.toLowerCase().includes(pincode) &&
+        (t.toLowerCase().includes("delivery") ||
+          t.toLowerCase().includes("serviceable") ||
+          t.toLowerCase().includes("deliverable"))
+    );
+
+    // ── Explicit "not serviceable" with pincode context ──────────────────
+    const explicitNotServiceable = deliveryTexts.some(
+      (t) =>
+        (t.toLowerCase().includes("not serviceable") ||
+          t.toLowerCase().includes("not deliverable") ||
+          t.toLowerCase().includes("cannot be delivered")) &&
+        (t.toLowerCase().includes(pincode) || deliveryTexts.length <= 10)
+    );
+
+    if (explicitNotServiceable || hasServiceableFalse) {
       return {
         available: false,
         deliveryInfo: `Not serviceable to pincode ${pincode}`,
@@ -294,22 +384,32 @@ function parseRomeApiResponse(
       };
     }
 
-    // Look for delivery date patterns in the raw JSON
-    const deliveryDateMatch = JSON.stringify(data).match(
-      /(?:delivery by|deliverydate|estimated delivery)[^"]*"([^"]*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[^"]*\d{1,2}[^"]*\d{0,4})/i
+    // ── Delivery date in delivery section context ────────────────────────
+    const deliveryDateMatch = deliveryTexts.join(" ").match(
+      /(?:delivery by|deliverydate|estimated delivery|arrives by)\s*:?\s*([^"]*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[^"]*\d{1,2}[^"]*\d{0,4})/i
     );
     const deliveryDate = deliveryDateMatch ? deliveryDateMatch[1].trim() : null;
 
-    // Positive delivery signals
-    const deliverableKeywords = [
-      "delivery by",
-      "free delivery",
-      "arrives by",
-      "estimated delivery",
-      "delivery in",
-      "delivered by",
-    ];
-    if (deliverableKeywords.some((k) => json.includes(k))) {
+    // ── Positive delivery signals from delivery section ──────────────────
+    // Only if the section mentions the pincode or has explicit delivery promise
+    const hasDeliverySignal = deliveryTexts.some((t) => {
+      const lower = t.toLowerCase();
+      return (
+        (lower.includes("delivery by") || lower.includes("delivered by") ||
+         lower.includes("arrives by") || lower.includes("estimated delivery")) &&
+        (lower.includes(pincode) || deliveryDate || deliveryTexts.length <= 5)
+      );
+    });
+
+    // Free delivery in the general context is NOT a pincode availability signal
+    // Only match if near the pincode in delivery section
+    const hasFreeDeliveryInContext = deliveryTexts.some(
+      (t) =>
+        t.toLowerCase().includes("free delivery") &&
+        (t.toLowerCase().includes(pincode) || deliveryTexts.length <= 3)
+    );
+
+    if ((hasDeliverySignal || hasFreeDeliveryInContext || (pincodeNearDelivery && hasServiceableTrue)) && !hasServiceableFalse) {
       return {
         available: true,
         deliveryInfo: deliveryDate
@@ -319,36 +419,12 @@ function parseRomeApiResponse(
       };
     }
 
-    // Check for serviceability flags in structured data
-    const dataStr = JSON.stringify(data);
-    if (
-      dataStr.includes('"isServiceable":true') ||
-      dataStr.includes('"serviceable":true') ||
-      dataStr.includes('"available":true')
-    ) {
-      return {
-        available: true,
-        deliveryInfo: `Delivery available to ${pincode}`,
-        deliveryDate: null,
-      };
-    }
-    if (
-      dataStr.includes('"isServiceable":false') ||
-      dataStr.includes('"serviceable":false')
-    ) {
-      return {
-        available: false,
-        deliveryInfo: `Not serviceable to pincode ${pincode}`,
-        deliveryDate: null,
-      };
-    }
+    // ── Global out of stock in product section (not pincode specific) ────
+    const globalOutOfStock =
+      lowerJson.includes("out of stock") &&
+      !lowerJson.includes("in stock");
 
-    // Out of stock signals
-    if (
-      json.includes("out of stock") ||
-      json.includes("currently unavailable") ||
-      json.includes("sold out")
-    ) {
+    if (globalOutOfStock) {
       return {
         available: false,
         deliveryInfo: "Product is currently out of stock",
@@ -426,12 +502,126 @@ async function checkViaRomeApi(
 // Strategy B: Product page with X-Pincode header
 // ---------------------------------------------------------------------------
 
+/**
+ * Extract JSON data from a <script> tag in HTML by matching a variable assignment.
+ * Supports __NEXT_DATA__, __INITIAL_STATE__, and similar patterns.
+ */
+function extractJsonFromScriptTag(
+  html: string,
+  variableName: string
+): Record<string, unknown> | null {
+  try {
+    const regex = new RegExp(
+      `<script[^>]*>\\s*window\\.${variableName}\\s*=\\s*(\\{[\\s\\S]+?\\});?\\s*<\\/script>`,
+      "i"
+    );
+    const match = html.match(regex);
+    if (!match) return null;
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walk the __NEXT_DATA__ / __INITIAL_STATE__ JSON tree looking for
+ * delivery/serviceability data related to a specific pincode.
+ */
+function findPincodeAvailabilityInPageState(
+  data: unknown,
+  pincode: string
+): {
+  available: boolean;
+  deliveryInfo: string | null;
+  deliveryDate: string | null;
+} | null {
+  try {
+    const dataStr = JSON.stringify(data);
+    const lower = dataStr.toLowerCase();
+
+    // Check for explicit "not serviceable" WITH the pincode nearby
+    const pincodeInData = lower.includes(pincode);
+    const hasNotServiceable =
+      lower.includes("not serviceable") ||
+      lower.includes("not deliverable") ||
+      lower.includes("cannot be delivered");
+
+    const hasDeliveryPromise =
+      lower.includes("delivery by") ||
+      lower.includes("delivered by") ||
+      lower.includes("arrives by") ||
+      lower.includes("estimated delivery") ||
+      lower.includes("delivery promise");
+
+    const hasServiceableTrue =
+      dataStr.includes('"isServiceable":true') ||
+      dataStr.includes('"serviceable":true');
+
+    const hasServiceableFalse =
+      dataStr.includes('"isServiceable":false') ||
+      dataStr.includes('"serviceable":false');
+
+    // Only trust these signals if the pincode is referenced in the data,
+    // or if the signal is very explicit
+    if (hasNotServiceable && (pincodeInData || hasServiceableFalse)) {
+      return {
+        available: false,
+        deliveryInfo: `Not serviceable to pincode ${pincode}`,
+        deliveryDate: null,
+      };
+    }
+
+    const deliveryDateMatch = dataStr.match(
+      /(?:delivery by|deliverydate|estimated delivery)[^"]*"([^"]*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[^"]*\d{1,2}[^"]*\d{0,4})/i
+    );
+    const deliveryDate = deliveryDateMatch ? deliveryDateMatch[1].trim() : null;
+
+    if (hasDeliveryPromise && (pincodeInData || hasServiceableTrue)) {
+      return {
+        available: true,
+        deliveryInfo: deliveryDate
+          ? `Delivery by ${deliveryDate}`
+          : `Delivery available to ${pincode}`,
+        deliveryDate,
+      };
+    }
+
+    if (hasServiceableTrue && !hasServiceableFalse) {
+      return {
+        available: true,
+        deliveryInfo: `Delivery available to ${pincode}`,
+        deliveryDate: null,
+      };
+    }
+
+    if (hasServiceableFalse) {
+      return {
+        available: false,
+        deliveryInfo: `Not serviceable to pincode ${pincode}`,
+        deliveryDate: null,
+      };
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strategy B: Check availability via page fetch with X-Pincode header,
+ * plus __NEXT_DATA__ / __INITIAL_STATE__ parsing.
+ *
+ * The page fetch alone is unreliable for pincode-specific delivery info
+ * (the checkout widget loads dynamically). The real value is in parsing
+ * the embedded JSON state which Flipkart's Next.js app uses to render
+ * the page.
+ */
 async function checkViaPageFetchWithPincode(
   productUrl: string,
   pincode: string
 ): Promise<FlipkartApiResult | null> {
   try {
-    // Flipkart's mobile BFF respects X-Pincode and renders delivery info in HTML
     const response = await fetch(productUrl, {
       headers: {
         "User-Agent":
@@ -440,7 +630,6 @@ async function checkViaPageFetchWithPincode(
         "Accept-Language": "en-IN,en;q=0.9",
         "X-Pincode": pincode,
         "X-Location": pincode,
-        // Cookie pincode value — some Flipkart servers still honour this
         Cookie: `pincode=${pincode}; T=1; SN=1;`,
         Referer: "https://www.flipkart.com/",
         Connection: "keep-alive",
@@ -453,7 +642,6 @@ async function checkViaPageFetchWithPincode(
     const html = await response.text();
     const lowerHtml = html.toLowerCase();
 
-    // Verify we got the actual product page
     const productId = extractFlipkartProductId(productUrl);
     const isProductPage =
       lowerHtml.includes('"@type":"product"') ||
@@ -462,76 +650,115 @@ async function checkViaPageFetchWithPincode(
       lowerHtml.includes("buy now") ||
       lowerHtml.includes("currently out of stock");
 
-    if (!isProductPage) return null;
-
-    // Not-serviceable patterns
-    const notServiceable = [
-      "not serviceable",
-      "not deliverable",
-      "delivery not available",
-      "cannot be delivered",
-      "pin code is not serviceable",
-      "pincode is not serviceable",
-      "no sellers deliver to this pincode",
-      "this product is not available in your area",
-      "seller does not deliver to your location",
-    ].some((p) => lowerHtml.includes(p));
-
-    if (notServiceable) {
-      return {
-        success: true,
-        productName: null,
-        description: null,
-        imageUrl: null,
-        price: null,
-        pincode,
-        available: false,
-        deliveryInfo: `Not serviceable to pincode ${pincode}`,
-        deliveryDate: null,
-        error: null,
-        source: "page_fetch",
-      };
+    if (!isProductPage) {
+      // Try __NEXT_DATA__ anyway
+      const nextData = extractJsonFromScriptTag(html, "__NEXT_DATA__");
+      if (nextData) {
+        const stateResult = findPincodeAvailabilityInPageState(nextData, pincode);
+        if (stateResult) {
+          return {
+            success: true,
+            productName: null,
+            description: null,
+            imageUrl: null,
+            price: null,
+            pincode,
+            available: stateResult.available,
+            deliveryInfo: stateResult.deliveryInfo,
+            deliveryDate: stateResult.deliveryDate,
+            error: null,
+            source: "next_data",
+          };
+        }
+      }
+      return null;
     }
 
-    // Delivery-available patterns
-    const deliverablePatterns = [
-      "delivery by",
-      "delivered by",
-      "free delivery",
-      "arrives by",
-      "estimated delivery",
-      "delivery in",
-    ];
-    const isDeliverable = deliverablePatterns.some((p) => lowerHtml.includes(p));
+    // ── Parse __NEXT_DATA__ / __INITIAL_STATE__ for structured delivery info ──
+    const nextData = extractJsonFromScriptTag(html, "__NEXT_DATA__");
+    const initState = extractJsonFromScriptTag(html, "__INITIAL_STATE__");
+    const pageState = nextData || initState;
 
-    if (isDeliverable) {
-      const deliveryDateMatch = html.match(
-        /[Dd]elivery\s+by[^<>"]{0,60}?([A-Z][a-z]+\s+\d+)/
-      );
-      const deliveryDate = deliveryDateMatch ? deliveryDateMatch[1] : null;
-      return {
-        success: true,
-        productName: null,
-        description: null,
-        imageUrl: null,
-        price: null,
-        pincode,
-        available: true,
-        deliveryInfo: deliveryDate
-          ? `Delivery by ${deliveryDate}`
-          : `Delivery available to ${pincode}`,
-        deliveryDate,
-        error: null,
-        source: "page_fetch",
-      };
+    if (pageState) {
+      const stateResult = findPincodeAvailabilityInPageState(pageState, pincode);
+      if (stateResult) {
+        return {
+          success: true,
+          productName: null,
+          description: null,
+          imageUrl: null,
+          price: null,
+          pincode,
+          available: stateResult.available,
+          deliveryInfo: stateResult.deliveryInfo,
+          deliveryDate: stateResult.deliveryDate,
+          error: null,
+          source: "next_data",
+        };
+      }
     }
 
+    // ── HTML keyword matching (conservative — only match near pincode) ──────
+    // Instead of searching the entire page, look in a 500-char window around
+    // the pincode value. This avoids false matches from global site chrome.
+    const pincodeIndex = lowerHtml.indexOf(pincode);
+    if (pincodeIndex >= 0) {
+      const start = Math.max(0, pincodeIndex - 300);
+      const end = Math.min(lowerHtml.length, pincodeIndex + 300);
+      const pincodeContext = lowerHtml.slice(start, end);
+
+      const hasNotServiceableNearby =
+        pincodeContext.includes("not serviceable") ||
+        pincodeContext.includes("not deliverable") ||
+        pincodeContext.includes("cannot be delivered") ||
+        pincodeContext.includes("delivery not available");
+
+      if (hasNotServiceableNearby) {
+        return {
+          success: true,
+          productName: null,
+          description: null,
+          imageUrl: null,
+          price: null,
+          pincode,
+          available: false,
+          deliveryInfo: `Not serviceable to pincode ${pincode}`,
+          deliveryDate: null,
+          error: null,
+          source: "page_fetch",
+        };
+      }
+
+      const hasDeliveryNearby =
+        pincodeContext.includes("delivery by") ||
+        pincodeContext.includes("delivered by") ||
+        pincodeContext.includes("arrives by") ||
+        pincodeContext.includes("estimated delivery");
+
+      if (hasDeliveryNearby) {
+        return {
+          success: true,
+          productName: null,
+          description: null,
+          imageUrl: null,
+          price: null,
+          pincode,
+          available: true,
+          deliveryInfo: `Delivery available to ${pincode}`,
+          deliveryDate: null,
+          error: null,
+          source: "page_fetch",
+        };
+      }
+    }
+
+    // ── Global out of stock (no pincode context needed) ──────────────────────
     const isOutOfStock =
       lowerHtml.includes("currently out of stock") ||
       lowerHtml.includes("sold out") ||
       lowerHtml.includes("currently unavailable");
 
-    if (isOutOfStock) {
+    if (isOutOfStock && pincodeIndex < 0) {
       return {
         success: true,
         productName: null,
@@ -547,7 +774,6 @@ async function checkViaPageFetchWithPincode(
       };
     }
 
-    // Page loaded but no delivery signal — ambiguous, return null so next strategy runs
     return null;
   } catch (err) {
     console.log("Page-fetch check failed:", err);
@@ -600,7 +826,7 @@ async function checkViaPuppeteer(
  *
  * Tries strategies in order:
  *   A → Rome API (fastest, most accurate)
- *   B → Product page with X-Pincode header
+ *   B → Product page with X-Pincode header + __NEXT_DATA__ parsing
  *   C → Puppeteer browser automation (slowest, most reliable)
  *
  * If ALL strategies fail to get a definitive answer, returns
@@ -654,149 +880,4 @@ export async function checkFlipkartPincodeServiceability(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Amazon India availability check
-// ---------------------------------------------------------------------------
 
-export async function checkAmazonAvailability(
-  productUrl: string,
-  pincode: string
-): Promise<{
-  available: boolean;
-  deliveryInfo: string | null;
-  productName: string | null;
-  price: string | null;
-  description: string | null;
-  imageUrl: string | null;
-  source: "api" | "fallback";
-}> {
-  const asinMatch =
-    productUrl.match(/\/dp\/([A-Z0-9]{10})/i) ||
-    productUrl.match(/\/gp\/product\/([A-Z0-9]{10})/i);
-  const asin = asinMatch ? asinMatch[1] : null;
-
-  // Strategy A: Amazon's AJAX location API
-  if (asin) {
-    try {
-      const apiUrl = `https://www.amazon.in/gp/product/ajax?asin=${asin}&deviceType=web&buyingShowHideCheckoutButton=0&merchantId=&locationId=${pincode}&ie=UTF8&action=display&featureId=glow-ingress-itm-offer`;
-      const resp = await fetch(apiUrl, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Accept: "text/html, */*; q=0.01",
-          "Accept-Language": "en-IN,en;q=0.9",
-          "X-Requested-With": "XMLHttpRequest",
-          Referer: productUrl,
-        },
-        signal: AbortSignal.timeout(8_000),
-      });
-
-      if (resp.ok) {
-        const html = await resp.text();
-        const lowerHtml = html.toLowerCase();
-        const notAvailable =
-          lowerHtml.includes("doesn't deliver") ||
-          lowerHtml.includes("not available in") ||
-          lowerHtml.includes("this item cannot be shipped") ||
-          lowerHtml.includes("not serviceable");
-        const hasDelivery =
-          lowerHtml.includes("delivery") || lowerHtml.includes("arrives");
-        const available = !notAvailable && hasDelivery;
-
-        const deliveryMatch = html.match(
-          /delivery\s+(on|by)\s+([A-Z][a-z]+[\s,\d]+)/i
-        );
-        return {
-          available,
-          deliveryInfo: deliveryMatch
-            ? `Delivery ${deliveryMatch[1]} ${deliveryMatch[2].trim()}`
-            : available
-            ? "Delivery available"
-            : "Not deliverable to this pincode",
-          productName: null,
-          price: null,
-          description: null,
-          imageUrl: null,
-          source: "api",
-        };
-      }
-    } catch (err) {
-      console.log("Amazon API check failed:", err);
-    }
-  }
-
-  // Strategy B: Fetch product page
-  try {
-    const resp = await fetch(productUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        Cookie: `i18n-prefs=INR; lc-acbin=en_IN; gl=IN;`,
-        Referer: "https://www.amazon.in/",
-      },
-      signal: AbortSignal.timeout(15_000),
-    });
-    const html = await resp.text();
-    const lowerHtml = html.toLowerCase();
-
-    let name: string | null = null;
-    let price: string | null = null;
-    let imageUrl: string | null = null;
-    let description: string | null = null;
-
-    const titleMatch = html.match(/id="productTitle"[^>]*>\s*([\s\S]*?)\s*<\/span>/i);
-    if (titleMatch) name = titleMatch[1].trim();
-
-    const priceMatch = html.match(/class="a-price-whole"[^>]*>([0-9,]+)/i);
-    if (priceMatch) price = `₹${priceMatch[1].replace(/,/g, "")}`;
-
-    const imgMatch = html.match(/"large":"(https:[^"]+)"/);
-    if (imgMatch) imageUrl = imgMatch[1];
-
-    const bulletsMatch = html.match(
-      /id="feature-bullets"[\s\S]*?<ul[\s\S]*?>([\s\S]*?)<\/ul>/i
-    );
-    if (bulletsMatch) {
-      const bullets = [
-        ...bulletsMatch[1].matchAll(
-          /<span[^>]*class="a-list-item"[^>]*>([\s\S]*?)<\/span>/gi
-        ),
-      ];
-      const texts = bullets
-        .map((b) => b[1].replace(/<[^>]+>/g, "").trim())
-        .filter((t) => t.length > 5)
-        .slice(0, 4);
-      if (texts.length) description = texts.join(" • ");
-    }
-
-    const available =
-      (lowerHtml.includes("add to cart") || lowerHtml.includes("buy now")) &&
-      !lowerHtml.includes("currently unavailable") &&
-      !lowerHtml.includes("out of stock");
-
-    return {
-      available,
-      deliveryInfo: available
-        ? "Available on Amazon India"
-        : "Currently unavailable",
-      productName: name,
-      price,
-      description,
-      imageUrl,
-      source: "fallback",
-    };
-  } catch {
-    return {
-      available: false,
-      deliveryInfo: null,
-      productName: null,
-      price: null,
-      description: null,
-      imageUrl: null,
-      source: "fallback",
-    };
-  }
-}

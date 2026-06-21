@@ -15,9 +15,12 @@ import { lookupPincodeFromIndiaPost, type PincodeDetails } from "./india-post-ap
 import { detectPlatform } from "./platform";
 import {
   checkFlipkartPincodeServiceability,
-  checkAmazonAvailability,
   fetchFlipkartProductDetails,
 } from "./flipkart-api-checker";
+import { checkAmazonAvailability } from "./amazon-checker";
+import { db } from "@/db";
+import { products as productsTable, availability as availabilityTable } from "@/db/schema";
+import { eq, and } from "drizzle-orm";
 
 export interface AvailabilityCheckResult {
   pincode: string;
@@ -88,6 +91,44 @@ async function getProductPageData(productUrl: string, platform: string) {
 }
 
 // ---------------------------------------------------------------------------
+// DB cache helpers
+// ---------------------------------------------------------------------------
+
+async function persistAvailabilityCheck(
+  productUrl: string,
+  pincode: string,
+  result: AvailabilityCheckResult
+) {
+  try {
+    const [productRecord] = await db
+      .select({ id: productsTable.id })
+      .from(productsTable)
+      .where(eq(productsTable.url, productUrl))
+      .limit(1);
+    if (!productRecord) return;
+    await db
+      .insert(availabilityTable)
+      .values({
+        productId: productRecord.id,
+        pincode,
+        city: result.pincodeDetails?.district || "Unknown",
+        state: result.pincodeDetails?.state || "Unknown",
+        available: result.available,
+        lastChecked: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [availabilityTable.productId, availabilityTable.pincode],
+        set: {
+          available: result.available,
+          lastChecked: new Date(),
+        },
+      });
+  } catch {
+    // Non-critical — don't let cache writes block the response
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Single pincode check
 // ---------------------------------------------------------------------------
 
@@ -100,10 +141,60 @@ async function getProductPageData(productUrl: string, platform: string) {
  */
 export async function checkSinglePincodeAvailability(
   productUrl: string,
-  pincode: string
+  pincode: string,
+  options?: { skipCache?: boolean }
 ): Promise<AvailabilityCheckResult> {
   const pincodeDetails = await lookupPincodeFromIndiaPost(pincode);
   const platform = detectPlatform(productUrl);
+
+  // Check DB cache first (avoids hitting Flipkart/Amazon for recently-checked products)
+  if (!options?.skipCache) {
+    try {
+      const [productRecord] = await db
+        .select({ id: productsTable.id })
+        .from(productsTable)
+        .where(eq(productsTable.url, productUrl))
+        .limit(1);
+
+      if (productRecord) {
+        const [cached] = await db
+          .select({
+            available: availabilityTable.available,
+            city: availabilityTable.city,
+            state: availabilityTable.state,
+            lastChecked: availabilityTable.lastChecked,
+          })
+          .from(availabilityTable)
+          .where(
+            and(
+              eq(availabilityTable.productId, productRecord.id),
+              eq(availabilityTable.pincode, pincode)
+            )
+          )
+          .limit(1);
+
+        if (cached && cached.lastChecked) {
+          const ageMs = Date.now() - new Date(cached.lastChecked).getTime();
+          if (ageMs < 60 * 60 * 1000) {
+            return {
+              pincode,
+              pincodeDetails,
+              available: cached.available,
+              deliveryInfo: cached.available
+                ? "Delivery available (cached)"
+                : "Not deliverable to this pincode (cached)",
+              deliveryDate: null,
+              checkedAt: new Date(cached.lastChecked),
+              source: "real",
+              confidence: "confirmed",
+            };
+          }
+        }
+      }
+    } catch {
+      // Cache miss or DB error — proceed with real check
+    }
+  }
 
   if (platform === "flipkart") {
     try {
@@ -123,12 +214,37 @@ export async function checkSinglePincodeAvailability(
         };
       }
 
-      // Step 2: Pincode-specific serviceability check (Rome API → page fetch → Puppeteer)
+      // Step 2: Try Puppeteer first (100% accurate — actually visits the page and checks)
+      try {
+        const { checkFlipkartAvailabilityReal } = await import("./flipkart-real-checker");
+        const realResult = await checkFlipkartAvailabilityReal(productUrl, pincode);
+        if (realResult.success) {
+          const result: AvailabilityCheckResult = {
+            pincode,
+            pincodeDetails,
+            available: realResult.available,
+            deliveryInfo: realResult.deliveryInfo,
+            deliveryDate: null,
+            checkedAt: new Date(),
+            source: "real",
+            confidence: "confirmed" as const,
+          };
+          persistAvailabilityCheck(productUrl, pincode, result);
+          return result;
+        }
+        // Puppeteer failed — fall through to API-based checks
+        if (realResult.error) {
+          console.log(`Puppeteer unavailable (${realResult.error}), falling back to API...`);
+        }
+      } catch {
+        console.log("Puppeteer import failed, falling back to API-based checks...");
+      }
+
+      // Step 3: Pincode-specific serviceability check (Rome API → page fetch)
       const result = await checkFlipkartPincodeServiceability(productUrl, pincode);
 
       if (result.success) {
-        // We got a definitive answer
-        return {
+        const checkResult: AvailabilityCheckResult = {
           pincode,
           pincodeDetails,
           available: result.available,
@@ -138,15 +254,16 @@ export async function checkSinglePincodeAvailability(
           source: "real",
           confidence: "confirmed",
         };
+        persistAvailabilityCheck(productUrl, pincode, checkResult);
+        return checkResult;
       } else {
-        // All strategies exhausted — mark as unverified, NOT as "not available"
         const loc = pincodeDetails?.isValid
           ? `${pincodeDetails.district}, ${pincodeDetails.state}`
           : pincode;
         return {
           pincode,
           pincodeDetails,
-          available: false, // default to false but confidence is unknown
+          available: false,
           deliveryInfo:
             result.error ||
             `Could not verify delivery to ${loc}. Please check Flipkart directly.`,
@@ -176,17 +293,19 @@ export async function checkSinglePincodeAvailability(
 
   if (platform === "amazon_india") {
     try {
-      const result = await checkAmazonAvailability(productUrl, pincode);
-      return {
+      const amazonResult = await checkAmazonAvailability(productUrl, pincode);
+      const amazonCheckResult: AvailabilityCheckResult = {
         pincode,
         pincodeDetails,
-        available: result.available,
-        deliveryInfo: result.deliveryInfo,
+        available: amazonResult.available,
+        deliveryInfo: amazonResult.deliveryInfo,
         deliveryDate: null,
         checkedAt: new Date(),
         source: "real",
-        confidence: result.source === "api" ? "confirmed" : "confirmed",
+        confidence: "confirmed" as const,
       };
+      persistAvailabilityCheck(productUrl, pincode, amazonCheckResult);
+      return amazonCheckResult;
     } catch (err) {
       console.error("Amazon serviceability check error:", err);
       return {

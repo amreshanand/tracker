@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { getPlatformLabel, detectPlatform } from "@/lib/platform";
 
 interface AvailabilityResult {
@@ -101,6 +101,11 @@ export function TrackerWidget() {
   };
 
   // Auto-scrape metadata when a valid URL is entered/pasted
+  const lastFetchedUrlRef = useRef(lastFetchedUrl);
+  useEffect(() => {
+    lastFetchedUrlRef.current = lastFetchedUrl;
+  }, [lastFetchedUrl]);
+
   useEffect(() => {
     if (!productUrl || !isValidUrl(productUrl)) {
       const timer = setTimeout(() => {
@@ -110,7 +115,7 @@ export function TrackerWidget() {
       return () => clearTimeout(timer);
     }
 
-    if (productUrl === lastFetchedUrl) {
+    if (productUrl === lastFetchedUrlRef.current) {
       return;
     }
 
@@ -128,10 +133,7 @@ export function TrackerWidget() {
           const data = await res.json();
           if (data.success) {
             setScrapedMetadata(data);
-            // Auto-fill product name if empty or default
-            if (!productName || productName === "Unknown Product" || productName === "") {
-              setProductName(data.name);
-            }
+            setProductName(prev => !prev || prev === "Unknown Product" ? data.name : prev);
           }
         }
       } catch (err) {
@@ -143,7 +145,7 @@ export function TrackerWidget() {
     }, 800);
 
     return () => clearTimeout(timer);
-  }, [productUrl, lastFetchedUrl, productName]);
+  }, [productUrl]);
 
   const selectSample = useCallback((sample: typeof SAMPLE_PRODUCTS[number]) => {
     setProductName(sample.name);

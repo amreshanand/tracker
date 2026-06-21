@@ -106,7 +106,13 @@ async function checkDelivery(pincode) {
       'not deliverable'
     ];
     
-    const available = !notAvailablePatterns.some(pattern => pageText.includes(pattern));
+    // Only consider available if we also find positive delivery indicators
+    const hasPositiveIndicator = pageText.includes('deliver') || 
+                                 pageText.includes('delivery') ||
+                                 pageText.includes('in stock') ||
+                                 document.querySelector('#delivery-message, #mir-layout-DELIVERY_BLOCK, [data-csa-c-delivery-price]') !== null;
+    const hasNegativeIndicator = notAvailablePatterns.some(pattern => pageText.includes(pattern));
+    const available = !hasNegativeIndicator && hasPositiveIndicator;
     
     // Try to get delivery info
     let deliveryInfo = null;

@@ -4,15 +4,28 @@ import { detectPlatform } from "@/lib/platform";
 import { lookupPincodeFromIndiaPost } from "@/lib/india-post-api";
 import {
   checkSinglePincodeAvailability,
+  checkBulkAvailabilityReal,
   getMajorCityPincodes,
   findNearestAvailable,
 } from "@/lib/availability-service";
+import { apiLimiter } from "@/lib/rate-limit";
 import { eq } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   try {
+    const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+      || request.headers.get("x-real-ip")
+      || "unknown";
+    const { allowed, retryAfter } = apiLimiter.check(`check:${ip}`);
+    if (!allowed) {
+      return Response.json(
+        { error: `Too many requests. Try again in ${retryAfter}s.` },
+        { status: 429, headers: { "Retry-After": String(retryAfter) } }
+      );
+    }
+
     const body = await request.json();
     const { productUrl, productName, pincode, checkAll, imageUrl, price, description } = body;
 
@@ -77,68 +90,35 @@ export async function POST(request: Request) {
     if (checkAll) {
       const majorCities = getMajorCityPincodes();
 
-      const results: Array<{
-        pincode: string;
-        city: string;
-        state: string;
-        district: string;
-        available: boolean;
-        confidence: string;
-        source: string;
-        deliveryInfo: string | null;
-        deliveryDate: string | null;
-        region: string;
-        postOffices: number;
-      }> = [];
+      const platform = detectPlatform(productUrl) || "";
+      const { results: bulkResults } = await checkBulkAvailabilityReal(
+        productUrl,
+        platform,
+        majorCities
+      );
 
-      const failedCities: string[] = [];
+      const results = bulkResults;
 
-      for (const cityInfo of majorCities) {
-        try {
-          const result = await checkSinglePincodeAvailability(
-            productUrl,
-            cityInfo.pincode
-          );
-
-          const pincodeData = result.pincodeDetails;
-
-          results.push({
-            pincode: cityInfo.pincode,
-            city: cityInfo.city,
-            state: pincodeData?.state || cityInfo.state,
-            district: pincodeData?.district || cityInfo.city,
-            available: result.available,
-            confidence: result.confidence,
-            source: result.source,
-            deliveryInfo: result.deliveryInfo,
-            deliveryDate: result.deliveryDate,
-            region: pincodeData?.region || "Unknown",
-            postOffices: pincodeData?.postOffices.length || 0,
-          });
-
-          // Only persist confirmed results to avoid polluting DB with noise
-          if (result.confidence === "confirmed") {
-            await db
-              .insert(availability)
-              .values({
-                productId: product.id,
-                pincode: cityInfo.pincode,
-                city: cityInfo.city,
-                state: pincodeData?.state || cityInfo.state,
-                available: result.available,
+      // Persist confirmed results to DB
+      for (const r of results) {
+        if (r.confidence === "confirmed") {
+          await db
+            .insert(availability)
+            .values({
+              productId: product.id,
+              pincode: r.pincode,
+              city: r.city,
+              state: r.state,
+              available: r.available,
+              lastChecked: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: [availability.productId, availability.pincode],
+              set: {
+                available: r.available,
                 lastChecked: new Date(),
-              })
-              .onConflictDoUpdate({
-                target: [availability.productId, availability.pincode],
-                set: {
-                  available: result.available,
-                  lastChecked: new Date(),
-                },
-              });
-          }
-        } catch (error) {
-          failedCities.push(cityInfo.city);
-          console.error(`Failed to check ${cityInfo.city}:`, error);
+              },
+            });
         }
       }
 
@@ -155,16 +135,13 @@ export async function POST(request: Request) {
 
       return Response.json({
         product,
-        totalChecked: results.length + failedCities.length,
+        totalChecked: results.length,
         availableCount: availableResults.length,
         unavailableCount: unavailableResults.length,
         unverifiedCount: unverifiedResults.length,
         available: availableResults,
         unavailable: unavailableResults,
         unverified: unverifiedResults,
-        note: failedCities.length
-          ? `Skipped due to error: ${failedCities.join(", ")}`
-          : undefined,
       });
     }
 

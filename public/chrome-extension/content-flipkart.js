@@ -127,7 +127,7 @@ async function checkDelivery(pincode) {
     
     // Check if the "Notify Me" button is visible instead of "Buy Now"
     // This is a strong indicator of unserviceability for specific products
-    const notifyMeBtn = document.querySelector('button._2KpZ6l._2uS64n, button[text*="Notify Me" i]');
+    const notifyMeBtn = findNotifyMeButton();
     const outOfStockText = pageText.includes('not available at this pincode') || pageText.includes('currently out of stock');
 
     const available = !notifyMeBtn && !outOfStockText;
@@ -170,6 +170,21 @@ function findCheckButton() {
     const text = btn.textContent.trim().toLowerCase();
     if (text === 'check' || text === 'apply') {
       // Make sure it's clickable and visible
+      const style = window.getComputedStyle(btn);
+      if (style.display !== 'none' && style.visibility !== 'hidden') {
+        return btn;
+      }
+    }
+  }
+  return null;
+}
+
+// Find the "Notify Me" button by iterating elements (CSS can't match text content)
+function findNotifyMeButton() {
+  const candidates = document.querySelectorAll('button._2KpZ6l._2uS64n, button');
+  for (const btn of candidates) {
+    const text = btn.textContent.trim().toLowerCase();
+    if (text.includes('notify me')) {
       const style = window.getComputedStyle(btn);
       if (style.display !== 'none' && style.visibility !== 'hidden') {
         return btn;

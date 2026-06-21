@@ -1,59 +1,68 @@
-// Background service worker for the extension
+const API_BASE_URL = 'https://your-app-url.com';
+const CHECK_INTERVAL = 4 * 60 * 60 * 1000;
+const MAX_RETRIES = 2;
 
-// Configuration
-const API_BASE_URL = 'https://your-app-url.com'; // Change this!
-const CHECK_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+async function fetchWithRetry(url, options = {}, retries = MAX_RETRIES) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        if (!response.ok && i < retries) continue;
+        return response;
+      } catch (err) {
+        if (i >= retries) throw err;
+        await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-// Setup alarm for periodic checks
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create('checkAlerts', { periodInMinutes: 240 }); // Every 4 hours
+  chrome.alarms.create('checkAlerts', { periodInMinutes: 240 });
   console.log('Product Availability Tracker installed');
 });
 
-// Handle alarm
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'checkAlerts') {
     processAlerts();
   }
 });
 
-// Process pending alerts by calling the backend
 async function processAlerts() {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/notifications/process`, {
-      method: 'POST'
+    const response = await fetchWithRetry(`${API_BASE_URL}/api/notifications/process`, {
+      method: 'GET'
     });
-    
+
     const data = await response.json();
-    
+
     if (data.results && data.results.notified > 0) {
-      // Show notification for each notified alert
-      data.results.notifications
-        .filter(n => n.status === 'notified')
-        .forEach(notification => {
-          chrome.notifications.create({
-            type: 'basic',
-            iconUrl: 'icons/icon128.png',
-            title: '🎉 Product Now Available!',
-            message: `${notification.productName} is now deliverable to ${notification.pincode}`,
-            priority: 2
-          });
+      const notified = data.results.notifications.filter(n => n.status === 'notified');
+      notified.forEach(notification => {
+        chrome.notifications.create({
+          type: 'basic',
+          iconUrl: 'icons/icon128.png',
+          title: 'Product Now Available!',
+          message: `${notification.productName} is now deliverable to ${notification.pincode}`,
+          priority: 2
         });
+      });
     }
-    
+
     console.log('Alert processing complete:', data.message);
   } catch (error) {
     console.error('Error processing alerts:', error);
   }
 }
 
-// Handle notification clicks
 chrome.notifications.onClicked.addListener((notificationId) => {
-  // Open the dashboard
   chrome.tabs.create({ url: `${API_BASE_URL}/dashboard` });
 });
 
-// Message handling
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'processAlerts') {
     processAlerts().then(() => sendResponse({ success: true }));

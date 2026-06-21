@@ -3,6 +3,7 @@ import {
   fetchFlipkartProductDetails,
   extractFlipkartProductId,
 } from "@/lib/flipkart-api-checker";
+import { apiLimiter } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -197,6 +198,17 @@ function extractFromHtml(html: string, platform: string) {
 
 export async function POST(request: Request) {
   try {
+    const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+      || request.headers.get("x-real-ip")
+      || "unknown";
+    const { allowed, retryAfter } = apiLimiter.check(`scrape:${ip}`);
+    if (!allowed) {
+      return Response.json(
+        { error: `Too many requests. Try again in ${retryAfter}s.` },
+        { status: 429, headers: { "Retry-After": String(retryAfter) } }
+      );
+    }
+
     const body = await request.json();
     const { url } = body;
 
@@ -213,6 +225,14 @@ export async function POST(request: Request) {
     }
 
     const platform = detectPlatform(url);
+
+    // Only allow known e-commerce platforms
+    if (!platform) {
+      return Response.json(
+        { error: "Unsupported platform. Only Flipkart and Amazon India URLs are supported." },
+        { status: 400 }
+      );
+    }
 
     let name = "";
     let description = "";

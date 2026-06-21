@@ -236,14 +236,7 @@ export async function sendAvailabilityNotification(data: {
   city: string;
   state: string;
 }): Promise<EmailResult> {
-  const { subject, html, text } = generateAvailabilityEmail({
-    userName: data.userName,
-    productName: data.productName,
-    productUrl: data.productUrl,
-    pincode: data.pincode,
-    city: data.city,
-    state: data.state,
-  });
+  const { subject, html, text } = generateAvailabilityEmail(data);
 
   return sendEmail({
     to: data.email,

@@ -1,23 +1,29 @@
 const API_BASE_URL = 'https://your-app-url.com';
-const CHECK_INTERVAL = 4 * 60 * 60 * 1000;
 const MAX_RETRIES = 2;
 
 async function fetchWithRetry(url, options = {}, retries = MAX_RETRIES) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    for (let i = 0; i <= retries; i++) {
-      try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        if (!response.ok && i < retries) continue;
-        return response;
-      } catch (err) {
-        if (i >= retries) throw err;
-        await new Promise(r => setTimeout(r, 2000 * (i + 1)));
-      }
+  for (let i = 0; i <= retries; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      if (response.ok) return response;
+      if (response.status < 500) return response; // don't retry 4xx
+    } catch {
+      if (i >= retries) throw new Error('Request failed after retries');
+    } finally {
+      clearTimeout(timer);
     }
-  } finally {
-    clearTimeout(timer);
+    if (i < retries) await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+  }
+}
+
+async function safeJson(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: 'Invalid response from server' };
   }
 }
 
@@ -38,7 +44,7 @@ async function processAlerts() {
       method: 'GET'
     });
 
-    const data = await response.json();
+    const data = await safeJson(response);
 
     if (data.results && data.results.notified > 0) {
       const notified = data.results.notifications.filter(n => n.status === 'notified');
@@ -47,19 +53,19 @@ async function processAlerts() {
           type: 'basic',
           iconUrl: 'icons/icon128.png',
           title: 'Product Now Available!',
-          message: `${notification.productName} is now deliverable to ${notification.pincode}`,
+          message: `${notification.productName || 'A product'} is now deliverable to ${notification.pincode}`,
           priority: 2
         });
       });
     }
 
-    console.log('Alert processing complete:', data.message);
+    console.log('Alert processing complete:', data.message || 'done');
   } catch (error) {
     console.error('Error processing alerts:', error);
   }
 }
 
-chrome.notifications.onClicked.addListener((notificationId) => {
+chrome.notifications.onClicked.addListener(() => {
   chrome.tabs.create({ url: `${API_BASE_URL}/dashboard` });
 });
 

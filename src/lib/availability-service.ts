@@ -13,10 +13,8 @@
 
 import { lookupPincodeFromIndiaPost, type PincodeDetails } from "./india-post-api";
 import { detectPlatform } from "./platform";
-import {
-  checkFlipkartPincodeServiceability,
-  fetchFlipkartProductDetails,
-} from "./flipkart-api-checker";
+import { checkFlipkartPincodeServiceability } from "./flipkart-availability";
+import { fetchFlipkartProductDetails } from "./flipkart-api-checker";
 import { checkAmazonAvailability } from "./amazon-checker";
 import { db } from "@/db";
 import { products as productsTable, availability as availabilityTable } from "@/db/schema";
@@ -174,15 +172,13 @@ export async function checkSinglePincodeAvailability(
           .limit(1);
 
         if (cached && cached.lastChecked) {
-          const ageMs = Date.now() - new Date(cached.lastChecked).getTime();
-          if (ageMs < 60 * 60 * 1000) {
+          const cachedTime = new Date(cached.lastChecked).getTime();
+          if (!isNaN(cachedTime) && Date.now() - cachedTime < 30 * 60 * 1000) {
             return {
               pincode,
               pincodeDetails,
               available: cached.available,
-              deliveryInfo: cached.available
-                ? "Delivery available (cached)"
-                : "Not deliverable to this pincode (cached)",
+              deliveryInfo: null,
               deliveryDate: null,
               checkedAt: new Date(cached.lastChecked),
               source: "real",

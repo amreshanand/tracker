@@ -89,21 +89,47 @@ async function processAlerts() {
           status: emailResult.success ? "sent" : "failed",
         });
 
-        await db
-          .update(alerts)
-          .set({ notified: true, notifiedAt: new Date() })
-          .where(eq(alerts.id, alert.alertId));
+        if (emailResult.success) {
+          const [updated] = await db
+            .update(alerts)
+            .set({ notified: true, notifiedAt: new Date() })
+            .where(and(eq(alerts.id, alert.alertId), eq(alerts.notified, false)))
+            .returning();
 
-        results.notified++;
-        results.notifications.push({
-          alertId: alert.alertId,
-          email: alert.email,
-          productName: alert.productName,
-          pincode: alert.pincode,
-          status: "notified",
-          emailSent: emailResult.success,
-          error: emailResult.error,
-        });
+          if (!updated) {
+            // Another cron run already marked this notified — skip
+            results.notifications.push({
+              alertId: alert.alertId,
+              email: alert.email,
+              productName: alert.productName,
+              pincode: alert.pincode,
+              status: "already_notified",
+              emailSent: true,
+            });
+            continue;
+          }
+
+          results.notified++;
+          results.notifications.push({
+            alertId: alert.alertId,
+            email: alert.email,
+            productName: alert.productName,
+            pincode: alert.pincode,
+            status: "notified",
+            emailSent: true,
+          });
+        } else {
+          results.errors++;
+          results.notifications.push({
+            alertId: alert.alertId,
+            email: alert.email,
+            productName: alert.productName,
+            pincode: alert.pincode,
+            status: "email_failed",
+            emailSent: false,
+            error: emailResult.error,
+          });
+        }
       } else {
         results.stillUnavailable++;
         results.notifications.push({

@@ -12,6 +12,13 @@ const notifyMessage = document.getElementById('notifyMessage');
 
 let currentProduct = null;
 
+function escapeHtml(str) {
+  if (str == null) return '';
+  const div = document.createElement('div');
+  div.textContent = String(str);
+  return div.innerHTML;
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -27,12 +34,21 @@ async function fetchWithRetry(url, options = {}, retries = 2) {
   for (let i = 0; i <= retries; i++) {
     try {
       const response = await fetchWithTimeout(url, options);
-      if (!response.ok && i < retries) continue;
-      return response;
+      if (response.ok) return response;
+      if (response.status < 500) return response;
     } catch (err) {
       if (i >= retries) throw err;
-      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     }
+    if (i < retries) await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+  }
+}
+
+async function safeJson(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: `Unexpected response (${response.status}). Please try again.` };
   }
 }
 
@@ -48,7 +64,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 async function getCurrentProduct() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab.url) return null;
+    if (!tab || !tab.url) return null;
 
     let platform = null;
     if (tab.url.includes('flipkart.com')) platform = 'flipkart';
@@ -77,7 +93,7 @@ async function getCurrentProduct() {
 }
 
 function displayProduct(product) {
-  if (!product) {
+  if (!product || !product.name) {
     productInfo.innerHTML = '<p>Open a product page on Flipkart or Amazon India</p>';
     productInfo.classList.add('empty');
     return;
@@ -88,12 +104,6 @@ function displayProduct(product) {
     <span class="product-platform">${product.platform === 'flipkart' ? 'Flipkart' : 'Amazon India'}</span>
     ${product.price ? `<span style="margin-left: 8px; font-weight: 600;">${escapeHtml(product.price)}</span>` : ''}
   `;
-}
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
 }
 
 async function checkAvailability() {
@@ -138,14 +148,14 @@ async function checkAvailability() {
         })
       });
 
-      const data = await response.json();
+      const data = await safeJson(response);
       displayAPIResult(data);
     }
   } catch (error) {
-    if (error.name === 'AbortError') {
+    if (error && error.name === 'AbortError') {
       resultsDiv.innerHTML = '<div class="message error">Request timed out. Please try again.</div>';
     } else {
-      resultsDiv.innerHTML = `<div class="message error">Error: ${escapeHtml(error.message)}</div>`;
+      resultsDiv.innerHTML = `<div class="message error">Error: ${escapeHtml(error && error.message || 'Unknown error')}</div>`;
     }
   } finally {
     checkBtn.disabled = false;
@@ -170,6 +180,11 @@ function displayResult(result, pincode) {
 }
 
 function displayAPIResult(data) {
+  if (!data) {
+    resultsDiv.innerHTML = '<div class="message error">No response from server. Please try again.</div>';
+    return;
+  }
+
   if (data.error) {
     resultsDiv.innerHTML = `<div class="message error">${escapeHtml(data.error)}</div>`;
     return;
@@ -206,7 +221,11 @@ function displayAPIResult(data) {
     }
 
     resultsDiv.innerHTML = html;
+    return;
   }
+
+  // Unknown response shape
+  resultsDiv.innerHTML = '<div class="message error">Unexpected response format. Please try again.</div>';
 }
 
 async function submitNotification() {
@@ -240,17 +259,17 @@ async function submitNotification() {
       })
     });
 
-    const data = await response.json();
+    const data = await safeJson(response);
 
     if (data.error) {
       notifyMessage.innerHTML = `<div class="message error">${escapeHtml(data.error)}</div>`;
     } else {
-      notifyMessage.innerHTML = `<div class="message success">✓ ${escapeHtml(data.message)}</div>`;
+      notifyMessage.innerHTML = `<div class="message success">✓ ${escapeHtml(data.message || 'Alert created!')}</div>`;
       chrome.storage.local.get(['alerts'], (result) => {
         const alerts = result.alerts || [];
         alerts.push({
-          id: data.alert.id,
-          productName: currentProduct.name,
+          id: data.alert && data.alert.id,
+          productName: currentProduct && currentProduct.name,
           pincode: pincode,
           email: email,
           createdAt: new Date().toISOString()
@@ -259,7 +278,7 @@ async function submitNotification() {
       });
     }
   } catch (error) {
-    notifyMessage.innerHTML = `<div class="message error">Error: ${escapeHtml(error.message)}</div>`;
+    notifyMessage.innerHTML = `<div class="message error">Error: ${escapeHtml(error && error.message || 'Could not reach server')}</div>`;
   } finally {
     notifyBtn.disabled = false;
   }

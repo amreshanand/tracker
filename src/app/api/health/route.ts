@@ -5,9 +5,17 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    await db.execute(sql`select 1`);
-    return Response.json({ ok: true });
-  } catch {
-    return Response.json({ ok: false }, { status: 500 });
+    const start = Date.now();
+    const result = await db.execute(sql`SELECT 1 as test`);
+    return Response.json({
+      ok: true,
+      queryTimeMs: Date.now() - start,
+      result: result.rows[0],
+    });
+  } catch (e: any) {
+    return Response.json(
+      { ok: false, error: e.message, code: e.code },
+      { status: 500 }
+    );
   }
 }
